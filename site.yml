@@ -1,0 +1,11 @@
+# Minimal site config (read by the generator)
+title: tkersey
+description: Personal notes and writing
+author: Thomas Kersey
+base_url: https://tkersey.github.io
+
+# Directory names (relative to repo root)
+posts_dir: posts
+static_dir: static
+dist_dir: dist
+
