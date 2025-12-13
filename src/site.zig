@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const front_matter = @import("front_matter.zig");
+
 pub const GenerateOptions = struct {
     out_dir_path: []const u8 = "dist",
     posts_dir_path: []const u8 = "posts",
@@ -65,7 +67,15 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         for (post_names.items) |md_name| {
             const stem = md_name[0 .. md_name.len - 3];
 
-            const base_slug = try slugify(allocator, stem);
+            const md = try pd.readFileAlloc(allocator, md_name, 10 * 1024 * 1024);
+            defer allocator.free(md);
+
+            var parsed = try front_matter.parse(allocator, md);
+            defer parsed.deinit(allocator);
+            if (parsed.front_matter.draft) continue;
+
+            const base_slug_input = parsed.front_matter.slug orelse stem;
+            const base_slug = try slugify(allocator, base_slug_input);
             var slug_needs_free = false;
             const slug: []const u8 = slug: {
                 if (slug_counts.getPtr(base_slug)) |count_ptr| {
@@ -84,12 +94,12 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
             const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug});
             defer allocator.free(html_name);
 
-            try generatePostPage(allocator, pd.*, out_dir, md_name, html_name, stem);
+            try generatePostPage(out_dir, html_name, parsed.front_matter.title, parsed.body);
 
             try index_writer.interface.writeAll("<li><a href=\"/");
             try writeEscapedHtml(&index_writer.interface, html_name);
             try index_writer.interface.writeAll("\">");
-            try writeEscapedHtml(&index_writer.interface, stem);
+            try writeEscapedHtml(&index_writer.interface, parsed.front_matter.title);
             try index_writer.interface.writeAll("</a></li>\n");
         }
     }
@@ -111,16 +121,11 @@ fn cleanDist(out_dir: std.fs.Dir) !void {
 }
 
 fn generatePostPage(
-    allocator: std.mem.Allocator,
-    posts_dir: std.fs.Dir,
     out_dir: std.fs.Dir,
-    md_name: []const u8,
     out_name: []const u8,
     title: []const u8,
+    md: []const u8,
 ) !void {
-    const md = try posts_dir.readFileAlloc(allocator, md_name, 10 * 1024 * 1024);
-    defer allocator.free(md);
-
     var out_file = try out_dir.createFile(out_name, .{ .truncate = true });
     defer out_file.close();
 
@@ -237,8 +242,20 @@ test "generate sorts posts" {
     defer tmp.cleanup();
 
     try tmp.dir.makePath("posts");
-    try tmp.dir.writeFile(.{ .sub_path = "posts/b.md", .data = "b\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = "a\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "posts/b.md", .data = 
+        \\---
+        \\title: B
+        \\date: 2025-12-02
+        \\---
+        \\b
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = 
+        \\---
+        \\title: A
+        \\date: 2025-12-01
+        \\---
+        \\a
+    });
 
     try generate(testing.allocator, tmp.dir, .{});
 
@@ -248,4 +265,39 @@ test "generate sorts posts" {
     const a_pos = std.mem.indexOf(u8, index, "/a.html") orelse return error.TestExpectedEqual;
     const b_pos = std.mem.indexOf(u8, index, "/b.html") orelse return error.TestExpectedEqual;
     try testing.expect(a_pos < b_pos);
+}
+
+test "generate skips drafts" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("posts");
+    try tmp.dir.writeFile(.{ .sub_path = "posts/public.md", .data = 
+        \\---
+        \\title: Public
+        \\date: 2025-12-01
+        \\---
+        \\hi
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "posts/draft.md", .data = 
+        \\---
+        \\title: Draft
+        \\date: 2025-12-02
+        \\draft: true
+        \\---
+        \\secret
+    });
+
+    try generate(testing.allocator, tmp.dir, .{});
+
+    const index = try tmp.dir.readFileAlloc(testing.allocator, "dist/index.html", 1024 * 1024);
+    defer testing.allocator.free(index);
+
+    try testing.expect(std.mem.indexOf(u8, index, "Public") != null);
+    try testing.expect(std.mem.indexOf(u8, index, "Draft") == null);
+
+    try tmp.dir.access("dist/public.html", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.access("dist/draft.html", .{}));
 }
