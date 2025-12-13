@@ -1,0 +1,7 @@
+.{
+    .name = .blog,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.15.2",
+    .paths = .{""},
+    .fingerprint = 0xc0155143fb3ee373,
+}
