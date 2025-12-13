@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  zig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: zig fmt --check build.zig src/*.zig
+      - run: zig build test
+      - run: zig build
+
+  automerge:
+    if: github.event_name == 'pull_request'
+    needs: zig
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+
+            const labels = pr.labels.map((l) => l.name);
+            if (!labels.includes("auto-merge")) {
+              core.info(`PR #${prNumber} missing 'auto-merge' label; skipping.`);
+              return;
+            }
+
+            if (pr.draft) {
+              core.info(`PR #${prNumber} is draft; skipping.`);
+              return;
+            }
+
+            if (pr.base?.ref !== "main") {
+              core.info(`PR #${prNumber} targets '${pr.base?.ref}', not 'main'; skipping.`);
+              return;
+            }
+
+            if (pr.head?.repo?.full_name !== `${owner}/${repo}`) {
+              core.info(`PR #${prNumber} is from a fork; skipping.`);
+              return;
+            }
+
+            core.info(`Merging PR #${prNumber} (squash).`);
+            await github.rest.pulls.merge({
+              owner,
+              repo,
+              pull_number: prNumber,
+              merge_method: "squash",
+            });
