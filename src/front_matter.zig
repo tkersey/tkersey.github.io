@@ -6,7 +6,7 @@ pub const Date = struct {
     day: u8,
 
     pub fn parseIso8601(input: []const u8) !Date {
-        if (input.len < 10) return error.FrontMatterInvalidDate;
+        if (input.len != 10) return error.FrontMatterInvalidDate;
         if (input[4] != '-' or input[7] != '-') return error.FrontMatterInvalidDate;
 
         const year = std.fmt.parseInt(i32, input[0..4], 10) catch return error.FrontMatterInvalidDate;
@@ -14,9 +14,25 @@ pub const Date = struct {
         const day = std.fmt.parseInt(u8, input[8..10], 10) catch return error.FrontMatterInvalidDate;
 
         if (month < 1 or month > 12) return error.FrontMatterInvalidDate;
-        if (day < 1 or day > 31) return error.FrontMatterInvalidDate;
+        const max_day = daysInMonth(year, month) orelse return error.FrontMatterInvalidDate;
+        if (day < 1 or day > max_day) return error.FrontMatterInvalidDate;
 
         return .{ .year = year, .month = month, .day = day };
+    }
+
+    fn daysInMonth(year: i32, month: u8) ?u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 => 31,
+            4, 6, 9, 11 => 30,
+            2 => if (isLeapYear(year)) 29 else 28,
+            else => null,
+        };
+    }
+
+    fn isLeapYear(year: i32) bool {
+        if (@mod(year, @as(i32, 400)) == 0) return true;
+        if (@mod(year, @as(i32, 100)) == 0) return false;
+        return @mod(year, @as(i32, 4)) == 0;
     }
 };
 
@@ -35,20 +51,29 @@ pub const FrontMatter = struct {
 };
 
 pub const ParsedPost = struct {
+    raw: []u8,
     front_matter: FrontMatter,
     body: []const u8,
 
     pub fn deinit(self: *ParsedPost, allocator: std.mem.Allocator) void {
         self.front_matter.deinit(allocator);
+        allocator.free(self.raw);
     }
 };
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !ParsedPost {
-    const split = try splitFrontMatter(input);
+    const raw = try allocator.dupe(u8, input);
+    return parseOwnedBuffer(allocator, raw);
+}
+
+pub fn parseOwnedBuffer(allocator: std.mem.Allocator, raw: []u8) !ParsedPost {
+    errdefer allocator.free(raw);
+
+    const split = try splitFrontMatter(raw);
     var fm = try parseFrontMatter(allocator, split.front_matter);
     errdefer fm.deinit(allocator);
 
-    return .{ .front_matter = fm, .body = split.body };
+    return .{ .raw = raw, .front_matter = fm, .body = split.body };
 }
 
 pub const Split = struct {
@@ -108,7 +133,7 @@ fn parseFrontMatter(allocator: std.mem.Allocator, input: []const u8) !FrontMatte
         if (list_key) |key| {
             if (std.mem.startsWith(u8, trimmed, "-")) {
                 const item_raw = std.mem.trimLeft(u8, trimmed[1..], " \t");
-                const item = parseScalar(item_raw);
+                const item = parseScalar(stripInlineComment(item_raw));
                 if (std.mem.eql(u8, key, "tags")) try tags.append(allocator, item);
                 continue;
             }
@@ -121,8 +146,11 @@ fn parseFrontMatter(allocator: std.mem.Allocator, input: []const u8) !FrontMatte
         value = stripInlineComment(value);
 
         if (value.len == 0) {
-            list_key = key;
-            continue;
+            if (std.mem.eql(u8, key, "tags")) {
+                list_key = key;
+                continue;
+            }
+            return error.FrontMatterInvalidSyntax;
         }
 
         if (std.mem.eql(u8, key, "tags")) {
@@ -175,12 +203,29 @@ fn parseFrontMatter(allocator: std.mem.Allocator, input: []const u8) !FrontMatte
 fn stripInlineComment(value: []const u8) []const u8 {
     const trimmed = std.mem.trimRight(u8, value, " \t");
     if (trimmed.len == 0) return trimmed;
-    if (trimmed[0] == '"' or trimmed[0] == '\'') return trimmed;
+
+    if (trimmed[0] == '"' or trimmed[0] == '\'') {
+        const quote = trimmed[0];
+        const end_quote = findClosingQuote(trimmed, quote) orelse return trimmed;
+        const after = std.mem.trimLeft(u8, trimmed[end_quote + 1 ..], " \t");
+        if (after.len == 0 or after[0] == '#') return trimmed[0 .. end_quote + 1];
+        return trimmed;
+    }
 
     const hash = std.mem.indexOfScalar(u8, trimmed, '#') orelse return trimmed;
     if (hash == 0) return "";
     if (!std.ascii.isWhitespace(trimmed[hash - 1])) return trimmed;
     return std.mem.trimRight(u8, trimmed[0..hash], " \t");
+}
+
+fn findClosingQuote(value: []const u8, quote: u8) ?usize {
+    var i: usize = 1;
+    while (i < value.len) : (i += 1) {
+        if (value[i] != quote) continue;
+        if (i > 0 and value[i - 1] == '\\') continue;
+        return i;
+    }
+    return null;
 }
 
 fn parseScalar(value: []const u8) []const u8 {
@@ -243,6 +288,95 @@ test "parse extracts required fields and tags list" {
     try testing.expect(!parsed.front_matter.draft);
     try testing.expect(parsed.front_matter.slug == null);
     try testing.expect(std.mem.indexOf(u8, parsed.body, "Body.") != null);
+}
+
+test "parse supports trailing comments after quoted scalars" {
+    const testing = std.testing;
+
+    const md =
+        \\---
+        \\title: "Hello" # comment
+        \\date: "2025-12-13" # another
+        \\tags:
+        \\  - zig # trailing
+        \\---
+        \\ok
+    ;
+
+    var parsed = try parse(testing.allocator, md);
+    defer parsed.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("Hello", parsed.front_matter.title);
+    try testing.expectEqualStrings("2025-12-13", parsed.front_matter.date_raw);
+    try testing.expectEqualStrings("zig", parsed.front_matter.tags.items[0]);
+}
+
+test "parse rejects invalid calendar dates" {
+    const testing = std.testing;
+
+    const md =
+        \\---
+        \\title: X
+        \\date: 2025-02-31
+        \\---
+        \\hi
+    ;
+
+    try testing.expectError(error.FrontMatterInvalidDate, parse(testing.allocator, md));
+}
+
+test "parse rejects extended date strings" {
+    const testing = std.testing;
+
+    const md =
+        \\---
+        \\title: X
+        \\date: 2025-12-01T00:00:00Z
+        \\---
+        \\hi
+    ;
+
+    try testing.expectError(error.FrontMatterInvalidDate, parse(testing.allocator, md));
+}
+
+test "parse rejects missing-value non-list keys" {
+    const testing = std.testing;
+
+    const md =
+        \\---
+        \\title: X
+        \\date: 2025-12-01
+        \\description:
+        \\---
+        \\hi
+    ;
+
+    try testing.expectError(error.FrontMatterInvalidSyntax, parse(testing.allocator, md));
+}
+
+test "parse returns owned slices (caller can free input)" {
+    const testing = std.testing;
+
+    const md =
+        \\---
+        \\title: Hello
+        \\date: 2025-12-13
+        \\---
+        \\Body
+    ;
+
+    const buf = try testing.allocator.dupe(u8, md);
+
+    var parsed = parse(testing.allocator, buf) catch |err| {
+        testing.allocator.free(buf);
+        return err;
+    };
+    // Free caller buffer to prove `parsed` is independent.
+    testing.allocator.free(buf);
+    defer parsed.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("Hello", parsed.front_matter.title);
+    try testing.expect(std.mem.indexOf(u8, parsed.body, "Body") != null);
 }
 
 test "parse supports inline tags" {

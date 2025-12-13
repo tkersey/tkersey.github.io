@@ -57,39 +57,39 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         };
         std.mem.sortUnstable([]const u8, post_names.items, SortContext{}, SortContext.lessThan);
 
-        var slug_counts: std.StringHashMapUnmanaged(u32) = .{};
+        var slug_owners: std.StringHashMapUnmanaged([]const u8) = .{};
         defer {
-            var it_slugs = slug_counts.iterator();
+            var it_slugs = slug_owners.iterator();
             while (it_slugs.next()) |kv| allocator.free(kv.key_ptr.*);
-            slug_counts.deinit(allocator);
+            slug_owners.deinit(allocator);
         }
 
         for (post_names.items) |md_name| {
             const stem = md_name[0 .. md_name.len - 3];
 
-            const md = try pd.readFileAlloc(allocator, md_name, 10 * 1024 * 1024);
-            defer allocator.free(md);
+            const md = pd.readFileAlloc(allocator, md_name, 10 * 1024 * 1024) catch |err| {
+                std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
+                return err;
+            };
 
-            var parsed = try front_matter.parse(allocator, md);
+            var parsed = front_matter.parseOwnedBuffer(allocator, md) catch |err| {
+                std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
+                return err;
+            };
             defer parsed.deinit(allocator);
             if (parsed.front_matter.draft) continue;
 
             const base_slug_input = parsed.front_matter.slug orelse stem;
-            const base_slug = try slugify(allocator, base_slug_input);
-            var slug_needs_free = false;
-            const slug: []const u8 = slug: {
-                if (slug_counts.getPtr(base_slug)) |count_ptr| {
-                    count_ptr.* += 1;
-                    const suffixed = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ base_slug, count_ptr.* });
-                    allocator.free(base_slug);
-                    slug_needs_free = true;
-                    break :slug suffixed;
-                }
-
-                try slug_counts.put(allocator, base_slug, 1);
-                break :slug base_slug;
-            };
-            defer if (slug_needs_free) allocator.free(slug);
+            const slug = try slugify(allocator, base_slug_input);
+            if (slug_owners.get(slug)) |owner| {
+                std.log.warn(
+                    "duplicate slug '{s}' for posts/{s} (already used by posts/{s})",
+                    .{ slug, md_name, owner },
+                );
+                allocator.free(slug);
+                return error.DuplicateSlug;
+            }
+            try slug_owners.put(allocator, slug, md_name);
 
             const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug});
             defer allocator.free(html_name);
@@ -300,4 +300,31 @@ test "generate skips drafts" {
 
     try tmp.dir.access("dist/public.html", .{});
     try testing.expectError(error.FileNotFound, tmp.dir.access("dist/draft.html", .{}));
+}
+
+test "generate errors on duplicate slugs" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("posts");
+    try tmp.dir.writeFile(.{ .sub_path = "posts/one.md", .data = 
+        \\---
+        \\title: One
+        \\date: 2025-12-01
+        \\slug: same
+        \\---
+        \\hi
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "posts/two.md", .data = 
+        \\---
+        \\title: Two
+        \\date: 2025-12-02
+        \\slug: same
+        \\---
+        \\hi
+    });
+
+    try testing.expectError(error.DuplicateSlug, generate(testing.allocator, tmp.dir, .{}));
 }
