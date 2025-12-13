@@ -1,6 +1,12 @@
 .{
     .name = .blog,
     .version = "0.0.1",
+    .dependencies = .{
+        .cmark_gfm = .{
+            .url = "git+https://github.com/kristoff-it/cmark-gfm.git#b96c27a5152b9124d657dee7fb1186d0a13c1fe4",
+            .hash = "cmark_gfm-0.1.0-uQgTK6WZFwCG9y7_Z0IkCINtmMTwvEZTyVh_6nsaMVPq",
+        },
+    },
     .minimum_zig_version = "0.15.2",
     .paths = .{""},
     .fingerprint = 0xc0155143fb3ee373,

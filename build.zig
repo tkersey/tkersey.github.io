@@ -9,11 +9,15 @@ pub fn build(b: *std.Build) void {
     }
 
     const host_target = b.resolveTargetQuery(.{});
+    const cmark_gfm_pkg = b.dependency("cmark_gfm", .{ .optimize = optimize, .target = host_target });
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = host_target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    root_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm"));
+    root_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm-extensions"));
 
     const exe = b.addExecutable(.{
         .name = "blog",
@@ -50,7 +54,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(test_root),
             .target = host_target,
             .optimize = optimize,
+            .link_libc = true,
         });
+        test_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm"));
+        test_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm-extensions"));
         const test_exe = b.addTest(.{ .root_module = test_module });
         const run_test = b.addRunArtifact(test_exe);
         test_step.dependOn(&run_test.step);
