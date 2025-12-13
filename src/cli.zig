@@ -35,20 +35,34 @@ pub fn run(
             const arg = args[idx];
             if (std.mem.eql(u8, arg, "--host")) {
                 idx += 1;
-                if (idx >= args.len) return error.InvalidArgs;
+                if (idx >= args.len) {
+                    try stderr.writeAll("error: --host requires a value\n\n");
+                    try printUsage(stderr);
+                    return 2;
+                }
                 host = args[idx];
             } else if (std.mem.eql(u8, arg, "--port")) {
                 idx += 1;
-                if (idx >= args.len) return error.InvalidArgs;
-                port = try std.fmt.parseInt(u16, args[idx], 10);
+                if (idx >= args.len) {
+                    try stderr.writeAll("error: --port requires a value\n\n");
+                    try printUsage(stderr);
+                    return 2;
+                }
+                port = std.fmt.parseInt(u16, args[idx], 10) catch {
+                    try stderr.print("error: invalid port '{s}'\n\n", .{args[idx]});
+                    try printUsage(stderr);
+                    return 2;
+                };
             } else {
-                return error.InvalidArgs;
+                try stderr.print("error: unknown argument '{s}'\n\n", .{arg});
+                try printUsage(stderr);
+                return 2;
             }
         }
 
         try site.generate(allocator, base_dir, .{});
         try stdout.print("Serving dist/ at http://{s}:{d}/\n", .{ host, port });
-        try server.serve(allocator, base_dir, .{ .host = host, .port = port });
+        try server.serve(base_dir, .{ .host = host, .port = port });
         return 0;
     }
 
@@ -75,15 +89,16 @@ fn printUsage(writer: anytype) !void {
 test "serve arg parsing rejects missing values" {
     const testing = std.testing;
 
-    var stdout_buf = std.ArrayList(u8).init(testing.allocator);
-    defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(testing.allocator);
-    defer stderr_buf.deinit();
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(testing.allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(testing.allocator);
 
-    const stdout_writer = stdout_buf.writer();
-    const stderr_writer = stderr_buf.writer();
+    const stdout_writer = stdout_buf.writer(testing.allocator);
+    const stderr_writer = stderr_buf.writer(testing.allocator);
 
     const args = [_][]const u8{ "blog", "serve", "--port" };
-    const result = run(testing.allocator, std.fs.cwd(), &args, stdout_writer, stderr_writer);
-    try testing.expectError(error.InvalidArgs, result);
+    const exit_code = try run(testing.allocator, std.fs.cwd(), &args, stdout_writer, stderr_writer);
+    try testing.expectEqual(@as(u8, 2), exit_code);
+    try testing.expect(std.mem.indexOf(u8, stderr_buf.items, "Usage:") != null);
 }

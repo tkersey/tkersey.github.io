@@ -6,23 +6,15 @@ pub const ServeOptions = struct {
     out_dir_path: []const u8 = "dist",
 };
 
-pub fn serve(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: ServeOptions) !void {
-    _ = allocator;
+pub fn serve(base_dir: std.fs.Dir, options: ServeOptions) !void {
     const address = try std.net.Address.parseIp(options.host, options.port);
     var tcp_server = try address.listen(.{ .reuse_address = true });
     defer tcp_server.deinit();
 
     while (true) {
         const connection = try tcp_server.accept();
-        _ = std.Thread.spawn(.{}, handleConnectionThread, .{ base_dir, options.out_dir_path, connection }) catch {
-            connection.stream.close();
-            continue;
-        };
+        handleConnection(base_dir, options.out_dir_path, connection) catch {};
     }
-}
-
-fn handleConnectionThread(base_dir: std.fs.Dir, out_dir_path: []const u8, connection: std.net.Server.Connection) void {
-    handleConnection(base_dir, out_dir_path, connection) catch {};
 }
 
 fn handleConnection(base_dir: std.fs.Dir, out_dir_path: []const u8, connection: std.net.Server.Connection) !void {
@@ -50,6 +42,8 @@ fn handleConnection(base_dir: std.fs.Dir, out_dir_path: []const u8, connection: 
 }
 
 fn serveRequest(request: *std.http.Server.Request, out_dir: std.fs.Dir) !void {
+    const max_file_size: u64 = 20 * 1024 * 1024;
+
     if (request.head.method != .GET and request.head.method != .HEAD) {
         const headers = [_]std.http.Header{
             .{ .name = "allow", .value = "GET, HEAD" },
@@ -85,13 +79,46 @@ fn serveRequest(request: *std.http.Server.Request, out_dir: std.fs.Dir) !void {
     };
     defer file.close();
 
-    const data = try file.readToEndAlloc(std.heap.page_allocator, 20 * 1024 * 1024);
-    defer std.heap.page_allocator.free(data);
+    const file_stat = file.stat() catch {
+        try respondNotFound(request);
+        return;
+    };
+    if (file_stat.size > max_file_size) {
+        const headers = [_]std.http.Header{
+            .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
+        };
+        try request.respond("File Too Large\n", .{
+            .status = .payload_too_large,
+            .extra_headers = &headers,
+        });
+        return;
+    }
 
     const headers = [_]std.http.Header{
         .{ .name = "content-type", .value = contentTypeForPath(file_path) },
     };
-    try request.respond(data, .{ .extra_headers = &headers });
+
+    var body_buf: [4096]u8 = undefined;
+    var body = try request.respondStreaming(&body_buf, .{
+        .content_length = file_stat.size,
+        .respond_options = .{
+            .extra_headers = &headers,
+        },
+    });
+    defer body.end() catch {};
+
+    if (!body.isEliding()) {
+        var read_buf: [8192]u8 = undefined;
+        var file_reader_buf: [8192]u8 = undefined;
+        var reader = file.reader(&file_reader_buf);
+
+        while (true) {
+            const n = try reader.interface.readSliceShort(&read_buf);
+            if (n == 0) break;
+            try body.writer.writeAll(read_buf[0..n]);
+            if (n < read_buf.len) break;
+        }
+    }
 }
 
 fn respondNotFound(request: *std.http.Server.Request) !void {
