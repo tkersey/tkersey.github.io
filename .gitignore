@@ -3,9 +3,9 @@
 
 # Zig
 zig-cache/
+.zig-cache/
 zig-out/
 
 # Editors
 .vscode/
 .idea/
-
