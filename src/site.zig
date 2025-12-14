@@ -29,7 +29,10 @@ const PostSummary = struct {
 };
 
 pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: GenerateOptions) !void {
+    try validateOutDirPath(options.out_dir_path);
     try base_dir.makePath(options.out_dir_path);
+
+    try validateOutDirWithinBase(allocator, base_dir, options.out_dir_path);
 
     var out_dir = try base_dir.openDir(options.out_dir_path, .{ .iterate = true });
     defer out_dir.close();
@@ -259,7 +262,36 @@ fn weekdayForDate(date: front_matter.Date) usize {
     return @intCast(@mod(dow, @as(i32, 7)));
 }
 
+fn validateOutDirPath(out_dir_path: []const u8) !void {
+    const trimmed = trimTrailingSeps(std.mem.trim(u8, out_dir_path, " \t"));
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) return error.InvalidOutDirPath;
+
+    if (std.fs.path.isAbsolute(trimmed)) return error.OutDirPathMustBeRelative;
+    if (std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.OutDirPathContainsNul;
+    if (std.mem.indexOfScalar(u8, trimmed, '\\') != null) return error.OutDirPathContainsBackslash;
+
+    var it = std.mem.splitScalar(u8, trimmed, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (std.mem.eql(u8, segment, ".")) continue;
+        if (std.mem.eql(u8, segment, "..")) return error.OutDirPathContainsDotDot;
+    }
+}
+
+fn validateOutDirWithinBase(allocator: std.mem.Allocator, base_dir: std.fs.Dir, out_dir_path: []const u8) !void {
+    const base_abs = try base_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base_abs);
+
+    const out_abs = try base_dir.realpathAlloc(allocator, out_dir_path);
+    defer allocator.free(out_abs);
+
+    if (std.mem.eql(u8, base_abs, out_abs)) return error.OutDirIsBaseDir;
+    if (!pathContains(base_abs, out_abs)) return error.OutDirEscapesBaseDir;
+}
+
 fn writeEscapedXml(w: *std.Io.Writer, input: []const u8) !void {
+    try validateXmlText(input);
+
     var start: usize = 0;
     for (input, 0..) |c, i| {
         const escaped: ?[]const u8 = switch (c) {
@@ -277,6 +309,27 @@ fn writeEscapedXml(w: *std.Io.Writer, input: []const u8) !void {
         }
     }
     if (start < input.len) try w.writeAll(input[start..]);
+}
+
+fn validateXmlText(input: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch return error.InvalidUtf8;
+        if (i + seq_len > input.len) return error.InvalidUtf8;
+
+        const cp = std.unicode.utf8Decode(input[i .. i + seq_len]) catch return error.InvalidUtf8;
+        if (!isValidXmlChar(cp)) return error.InvalidXmlChar;
+        i += seq_len;
+    }
+}
+
+fn isValidXmlChar(cp: u21) bool {
+    return cp == 0x9 or cp == 0xA or cp == 0xD or
+        (cp >= 0x20 and cp <= 0xD7FF) or
+        (cp >= 0xE000 and cp <= 0xFFFD) or
+        (cp >= 0x10000 and cp <= 0x10FFFF);
 }
 
 fn cleanDist(out_dir: std.fs.Dir) !void {
@@ -616,6 +669,18 @@ test "generate writes feed.xml with correct base_url, dates, and descriptions" {
     try testing.expect(std.mem.indexOf(u8, feed, "<pubDate>Sat, 13 Dec 2025 00:00:00 GMT</pubDate>") != null);
     try testing.expect(std.mem.indexOf(u8, feed, "<description>Desc &amp; &lt;b&gt;</description>") != null);
     try testing.expect(std.mem.indexOf(u8, feed, "<title>One &amp; &lt;Two&gt;</title>") != null);
+}
+
+test "generate rejects unsafe out_dir_path" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(error.InvalidOutDirPath, generate(testing.allocator, tmp.dir, .{ .out_dir_path = "" }));
+    try testing.expectError(error.InvalidOutDirPath, generate(testing.allocator, tmp.dir, .{ .out_dir_path = "." }));
+    try testing.expectError(error.OutDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .out_dir_path = ".." }));
+    try testing.expectError(error.OutDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .out_dir_path = "dist/../oops" }));
 }
 
 test "generate rejects overlapping static and output directories" {

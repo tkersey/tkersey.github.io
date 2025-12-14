@@ -3,6 +3,7 @@ const std = @import("std");
 const site = @import("site.zig");
 const server = @import("server.zig");
 const watch = @import("watch.zig");
+const scalars = @import("scalars.zig");
 
 const site_config_path: []const u8 = "site.yml";
 
@@ -11,7 +12,6 @@ const SiteConfig = struct {
 
     title: []const u8 = "Blog",
     description: []const u8 = "",
-    author: ?[]const u8 = null,
     base_url: []const u8 = "https://tkersey.github.io",
     posts_dir: []const u8 = "posts",
     static_dir: []const u8 = "static",
@@ -40,13 +40,12 @@ fn loadSiteConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !SiteConfi
         const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
         const key = std.mem.trimRight(u8, trimmed[0..colon], " \t");
         var value = std.mem.trimLeft(u8, trimmed[colon + 1 ..], " \t");
-        value = stripInlineComment(value);
-        const scalar = parseScalar(value);
+        value = scalars.stripInlineComment(value);
+        const scalar = scalars.parseScalar(value);
         if (scalar.len == 0) continue;
 
         if (std.mem.eql(u8, key, "title")) config.title = scalar;
         if (std.mem.eql(u8, key, "description")) config.description = scalar;
-        if (std.mem.eql(u8, key, "author")) config.author = scalar;
         if (std.mem.eql(u8, key, "base_url")) config.base_url = scalar;
         if (std.mem.eql(u8, key, "posts_dir")) config.posts_dir = scalar;
         if (std.mem.eql(u8, key, "static_dir")) config.static_dir = scalar;
@@ -69,6 +68,20 @@ fn generateFromConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir, log_wa
         .base_url = config.base_url,
         .log_warnings = log_warnings,
     });
+}
+
+fn watchTargetsFromConfig(config: SiteConfig) watch.WatchTargets {
+    return .{
+        .posts_dir_path = config.posts_dir,
+        .static_dir_path = config.static_dir,
+        .site_config_path = site_config_path,
+    };
+}
+
+fn fingerprintFromConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !u64 {
+    var config = try loadSiteConfig(allocator, base_dir);
+    defer config.deinit(allocator);
+    return watch.fingerprint(allocator, base_dir, watchTargetsFromConfig(config));
 }
 
 pub fn run(
@@ -189,11 +202,10 @@ pub fn run(
                 var watch_dir = dir;
                 defer watch_dir.close();
 
-                if (watch.fingerprint(allocator, watch_dir, .{})) |_| {
+                if (fingerprintFromConfig(allocator, watch_dir)) |_| {
                     const thread_args: WatchThreadArgs = .{
                         .base_dir = base_dir,
                         .poll_interval_ns = poll_ns,
-                        .targets = .{},
                     };
                     if (std.Thread.spawn(.{}, watchThreadMain, .{thread_args})) |thread| {
                         thread.detach();
@@ -237,7 +249,6 @@ fn printUsage(writer: anytype) !void {
 const WatchThreadArgs = struct {
     base_dir: std.fs.Dir,
     poll_interval_ns: u64,
-    targets: watch.WatchTargets,
 };
 
 fn watchThreadMain(args: WatchThreadArgs) void {
@@ -249,7 +260,7 @@ fn watchThreadMain(args: WatchThreadArgs) void {
     };
     defer base_dir.close();
 
-    var stable = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
+    var stable = fingerprintFromConfig(allocator, base_dir) catch |err| {
         std.log.err("watch: initial fingerprint failed: {s}", .{@errorName(err)});
         return;
     };
@@ -258,7 +269,7 @@ fn watchThreadMain(args: WatchThreadArgs) void {
     while (true) {
         std.Thread.sleep(args.poll_interval_ns);
 
-        const current = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
+        const current = fingerprintFromConfig(allocator, base_dir) catch |err| {
             std.log.err("watch: fingerprint failed: {s}", .{@errorName(err)});
             continue;
         };
@@ -280,42 +291,6 @@ fn watchThreadMain(args: WatchThreadArgs) void {
         };
         std.log.info("Rebuild complete.", .{});
     }
-}
-
-fn stripInlineComment(value: []const u8) []const u8 {
-    const trimmed = std.mem.trimRight(u8, value, " \t");
-    if (trimmed.len == 0) return trimmed;
-
-    if (trimmed[0] == '"' or trimmed[0] == '\'') {
-        const quote = trimmed[0];
-        const end_quote = findClosingQuote(trimmed, quote) orelse return trimmed;
-        const after = std.mem.trimLeft(u8, trimmed[end_quote + 1 ..], " \t");
-        if (after.len == 0 or after[0] == '#') return trimmed[0 .. end_quote + 1];
-        return trimmed;
-    }
-
-    const hash = std.mem.indexOfScalar(u8, trimmed, '#') orelse return trimmed;
-    if (hash == 0) return "";
-    if (!std.ascii.isWhitespace(trimmed[hash - 1])) return trimmed;
-    return std.mem.trimRight(u8, trimmed[0..hash], " \t");
-}
-
-fn findClosingQuote(value: []const u8, quote: u8) ?usize {
-    var i: usize = 1;
-    while (i < value.len) : (i += 1) {
-        if (value[i] != quote) continue;
-        if (i > 0 and value[i - 1] == '\\') continue;
-        return i;
-    }
-    return null;
-}
-
-fn parseScalar(value: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, value, " \t");
-    if (trimmed.len >= 2 and ((trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') or (trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\''))) {
-        return trimmed[1 .. trimmed.len - 1];
-    }
-    return trimmed;
 }
 
 test "serve arg parsing rejects missing values" {
