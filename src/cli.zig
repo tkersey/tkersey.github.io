@@ -3,6 +3,86 @@ const std = @import("std");
 const site = @import("site.zig");
 const server = @import("server.zig");
 const watch = @import("watch.zig");
+const scalars = @import("scalars.zig");
+
+const site_config_path: []const u8 = "site.yml";
+
+const SiteConfig = struct {
+    raw: ?[]u8 = null,
+
+    title: []const u8 = "Blog",
+    description: []const u8 = "",
+    base_url: []const u8 = "https://tkersey.github.io",
+    posts_dir: []const u8 = "posts",
+    static_dir: []const u8 = "static",
+    dist_dir: []const u8 = "dist",
+
+    pub fn deinit(self: *SiteConfig, allocator: std.mem.Allocator) void {
+        if (self.raw) |buf| allocator.free(buf);
+    }
+};
+
+fn loadSiteConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !SiteConfig {
+    const raw = base_dir.readFileAlloc(allocator, site_config_path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    errdefer allocator.free(raw);
+
+    var config: SiteConfig = .{ .raw = raw };
+
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |raw_line| {
+        const trimmed = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') continue;
+
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const key = std.mem.trimRight(u8, trimmed[0..colon], " \t");
+        var value = std.mem.trimLeft(u8, trimmed[colon + 1 ..], " \t");
+        value = scalars.stripInlineComment(value);
+        const scalar = scalars.parseScalar(value);
+        if (scalar.len == 0) continue;
+
+        if (std.mem.eql(u8, key, "title")) config.title = scalar;
+        if (std.mem.eql(u8, key, "description")) config.description = scalar;
+        if (std.mem.eql(u8, key, "base_url")) config.base_url = scalar;
+        if (std.mem.eql(u8, key, "posts_dir")) config.posts_dir = scalar;
+        if (std.mem.eql(u8, key, "static_dir")) config.static_dir = scalar;
+        if (std.mem.eql(u8, key, "dist_dir")) config.dist_dir = scalar;
+    }
+
+    return config;
+}
+
+fn generateFromConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir, log_warnings: bool) !void {
+    var config = try loadSiteConfig(allocator, base_dir);
+    defer config.deinit(allocator);
+
+    try site.generate(allocator, base_dir, .{
+        .out_dir_path = config.dist_dir,
+        .posts_dir_path = config.posts_dir,
+        .static_dir_path = config.static_dir,
+        .site_title = config.title,
+        .site_description = config.description,
+        .base_url = config.base_url,
+        .log_warnings = log_warnings,
+    });
+}
+
+fn watchTargetsFromConfig(config: SiteConfig) watch.WatchTargets {
+    return .{
+        .posts_dir_path = config.posts_dir,
+        .static_dir_path = config.static_dir,
+        .site_config_path = site_config_path,
+    };
+}
+
+fn fingerprintFromConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !u64 {
+    var config = try loadSiteConfig(allocator, base_dir);
+    defer config.deinit(allocator);
+    return watch.fingerprint(allocator, base_dir, watchTargetsFromConfig(config));
+}
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -23,8 +103,17 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, cmd, "build")) {
-        try site.generate(allocator, base_dir, .{});
-        try stdout.print("Generated site in dist/\n", .{});
+        var config = try loadSiteConfig(allocator, base_dir);
+        defer config.deinit(allocator);
+        try site.generate(allocator, base_dir, .{
+            .out_dir_path = config.dist_dir,
+            .posts_dir_path = config.posts_dir,
+            .static_dir_path = config.static_dir,
+            .site_title = config.title,
+            .site_description = config.description,
+            .base_url = config.base_url,
+        });
+        try stdout.print("Generated site in {s}/\n", .{config.dist_dir});
         return 0;
     }
 
@@ -82,8 +171,18 @@ pub fn run(
             }
         }
 
-        try site.generate(allocator, base_dir, .{});
-        try stdout.print("Serving dist/ at http://{s}:{d}/\n", .{ host, port });
+        var config = try loadSiteConfig(allocator, base_dir);
+        defer config.deinit(allocator);
+
+        try site.generate(allocator, base_dir, .{
+            .out_dir_path = config.dist_dir,
+            .posts_dir_path = config.posts_dir,
+            .static_dir_path = config.static_dir,
+            .site_title = config.title,
+            .site_description = config.description,
+            .base_url = config.base_url,
+        });
+        try stdout.print("Serving {s}/ at http://{s}:{d}/\n", .{ config.dist_dir, host, port });
         if (watch_enabled) {
             const max_poll_ms: u64 = 60_000;
             if (poll_ms > max_poll_ms) {
@@ -103,11 +202,10 @@ pub fn run(
                 var watch_dir = dir;
                 defer watch_dir.close();
 
-                if (watch.fingerprint(allocator, watch_dir, .{})) |_| {
+                if (fingerprintFromConfig(allocator, watch_dir)) |_| {
                     const thread_args: WatchThreadArgs = .{
                         .base_dir = base_dir,
                         .poll_interval_ns = poll_ns,
-                        .targets = .{},
                     };
                     if (std.Thread.spawn(.{}, watchThreadMain, .{thread_args})) |thread| {
                         thread.detach();
@@ -124,7 +222,7 @@ pub fn run(
 
             if (watcher_started) try stdout.print("Watching for changes (polling every {d}ms)\n", .{poll_ms});
         }
-        try server.serve(base_dir, .{ .host = host, .port = port });
+        try server.serve(base_dir, .{ .host = host, .port = port, .out_dir_path = config.dist_dir });
         return 0;
     }
 
@@ -151,7 +249,6 @@ fn printUsage(writer: anytype) !void {
 const WatchThreadArgs = struct {
     base_dir: std.fs.Dir,
     poll_interval_ns: u64,
-    targets: watch.WatchTargets,
 };
 
 fn watchThreadMain(args: WatchThreadArgs) void {
@@ -163,7 +260,7 @@ fn watchThreadMain(args: WatchThreadArgs) void {
     };
     defer base_dir.close();
 
-    var stable = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
+    var stable = fingerprintFromConfig(allocator, base_dir) catch |err| {
         std.log.err("watch: initial fingerprint failed: {s}", .{@errorName(err)});
         return;
     };
@@ -172,7 +269,7 @@ fn watchThreadMain(args: WatchThreadArgs) void {
     while (true) {
         std.Thread.sleep(args.poll_interval_ns);
 
-        const current = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
+        const current = fingerprintFromConfig(allocator, base_dir) catch |err| {
             std.log.err("watch: fingerprint failed: {s}", .{@errorName(err)});
             continue;
         };
@@ -188,7 +285,7 @@ fn watchThreadMain(args: WatchThreadArgs) void {
         pending = null;
 
         std.log.info("Change detected; rebuilding...", .{});
-        site.generate(allocator, base_dir, .{}) catch |err| {
+        generateFromConfig(allocator, base_dir, true) catch |err| {
             std.log.err("Rebuild failed: {s}", .{@errorName(err)});
             continue;
         };
