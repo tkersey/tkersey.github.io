@@ -13,7 +13,9 @@ pub fn serve(base_dir: std.fs.Dir, options: ServeOptions) !void {
 
     while (true) {
         const connection = try tcp_server.accept();
-        handleConnection(base_dir, options.out_dir_path, connection) catch {};
+        handleConnection(base_dir, options.out_dir_path, connection) catch |err| {
+            std.log.warn("serve: connection failed: {s}", .{@errorName(err)});
+        };
     }
 }
 
@@ -35,7 +37,11 @@ fn handleConnection(base_dir: std.fs.Dir, out_dir_path: []const u8, connection: 
             else => return err,
         };
 
-        serveRequest(&request, out_dir) catch {
+        serveRequest(&request, out_dir) catch |err| {
+            std.log.debug(
+                "serve: {s} {s} failed: {s}",
+                .{ @tagName(request.head.method), request.head.target, @errorName(err) },
+            );
             return;
         };
     }

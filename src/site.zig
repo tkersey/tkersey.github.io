@@ -30,6 +30,8 @@ const PostSummary = struct {
 
 pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: GenerateOptions) !void {
     try validateOutDirPath(options.out_dir_path);
+    try validatePostsDirPath(options.posts_dir_path);
+    try validateStaticDirPath(options.static_dir_path);
     try base_dir.makePath(options.out_dir_path);
 
     try validateOutDirWithinBase(allocator, base_dir, options.out_dir_path);
@@ -37,7 +39,7 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
     var out_dir = try base_dir.openDir(options.out_dir_path, .{ .iterate = true });
     defer out_dir.close();
 
-    try validateStaticAndOutDirs(allocator, base_dir, options.out_dir_path, options.static_dir_path);
+    try validateInputAndOutDirs(allocator, base_dir, options.out_dir_path, options.posts_dir_path, options.static_dir_path);
 
     try cleanDist(out_dir);
 
@@ -77,12 +79,7 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         std.mem.sortUnstable([]const u8, post_names.items, SortContext{}, SortContext.lessThan);
 
         var slug_owners: std.StringHashMapUnmanaged([]const u8) = .{};
-        var slug_owner_keys: std.ArrayListUnmanaged([]u8) = .{};
-        defer {
-            for (slug_owner_keys.items) |key| allocator.free(key);
-            slug_owner_keys.deinit(allocator);
-            slug_owners.deinit(allocator);
-        }
+        defer slug_owners.deinit(allocator);
 
         for (post_names.items) |md_name| {
             const stem = md_name[0 .. md_name.len - 3];
@@ -100,25 +97,20 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
             if (parsed.front_matter.draft) continue;
 
             const base_slug_input = parsed.front_matter.slug orelse stem;
-            const slug = try slugify(allocator, base_slug_input);
-            if (slug_owners.get(slug)) |owner| {
+            var slug_owned: ?[]u8 = try slugify(allocator, base_slug_input);
+            errdefer if (slug_owned) |s| allocator.free(s);
+
+            if (slug_owners.get(slug_owned.?)) |owner| {
                 if (options.log_warnings) {
                     std.log.warn(
                         "duplicate slug '{s}' for posts/{s} (already used by posts/{s})",
-                        .{ slug, md_name, owner },
+                        .{ slug_owned.?, md_name, owner },
                     );
                 }
-                allocator.free(slug);
                 return error.DuplicateSlug;
             }
-            const slug_key = try allocator.dupe(u8, slug);
-            slug_owner_keys.append(allocator, slug_key) catch |err| {
-                allocator.free(slug_key);
-                return err;
-            };
-            try slug_owners.put(allocator, slug_key, md_name);
 
-            const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug});
+            const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug_owned.?});
             defer allocator.free(html_name);
 
             generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.front_matter.date_raw, parsed.body) catch |err| {
@@ -126,16 +118,33 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
                 return err;
             };
 
+            var title_owned: ?[]u8 = try allocator.dupe(u8, parsed.front_matter.title);
+            errdefer if (title_owned) |t| allocator.free(t);
+
+            var date_raw_owned: ?[]u8 = try allocator.dupe(u8, parsed.front_matter.date_raw);
+            errdefer if (date_raw_owned) |d| allocator.free(d);
+
+            var description_owned: ?[]u8 = null;
+            errdefer if (description_owned) |d| allocator.free(d);
+            if (parsed.front_matter.description) |desc| {
+                description_owned = try allocator.dupe(u8, desc);
+            }
+
+            const slug = slug_owned.?;
             try posts.append(allocator, .{
-                .title = try allocator.dupe(u8, parsed.front_matter.title),
+                .title = title_owned.?,
                 .date = parsed.front_matter.date,
-                .date_raw = try allocator.dupe(u8, parsed.front_matter.date_raw),
+                .date_raw = date_raw_owned.?,
                 .slug = slug,
-                .description = if (parsed.front_matter.description) |desc|
-                    try allocator.dupe(u8, desc)
-                else
-                    null,
+                .description = description_owned,
             });
+
+            slug_owned = null;
+            title_owned = null;
+            date_raw_owned = null;
+            description_owned = null;
+
+            try slug_owners.put(allocator, slug, md_name);
         }
     }
 
@@ -262,19 +271,62 @@ fn weekdayForDate(date: front_matter.Date) usize {
     return @intCast(@mod(dow, @as(i32, 7)));
 }
 
-fn validateOutDirPath(out_dir_path: []const u8) !void {
-    const trimmed = trimTrailingSeps(std.mem.trim(u8, out_dir_path, " \t"));
-    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) return error.InvalidOutDirPath;
+const RelDirPathIssue = enum {
+    ok,
+    empty_or_dot,
+    absolute,
+    contains_nul,
+    contains_backslash,
+    contains_dotdot,
+};
 
-    if (std.fs.path.isAbsolute(trimmed)) return error.OutDirPathMustBeRelative;
-    if (std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.OutDirPathContainsNul;
-    if (std.mem.indexOfScalar(u8, trimmed, '\\') != null) return error.OutDirPathContainsBackslash;
+fn relDirPathIssue(path: []const u8) RelDirPathIssue {
+    const trimmed = trimTrailingSeps(std.mem.trim(u8, path, " \t"));
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) return .empty_or_dot;
+
+    if (std.fs.path.isAbsolute(trimmed)) return .absolute;
+    if (std.mem.indexOfScalar(u8, trimmed, 0) != null) return .contains_nul;
+    if (std.mem.indexOfScalar(u8, trimmed, '\\') != null) return .contains_backslash;
 
     var it = std.mem.splitScalar(u8, trimmed, '/');
     while (it.next()) |segment| {
         if (segment.len == 0) continue;
         if (std.mem.eql(u8, segment, ".")) continue;
-        if (std.mem.eql(u8, segment, "..")) return error.OutDirPathContainsDotDot;
+        if (std.mem.eql(u8, segment, "..")) return .contains_dotdot;
+    }
+    return .ok;
+}
+
+fn validateOutDirPath(out_dir_path: []const u8) !void {
+    switch (relDirPathIssue(out_dir_path)) {
+        .ok => return,
+        .empty_or_dot => return error.InvalidOutDirPath,
+        .absolute => return error.OutDirPathMustBeRelative,
+        .contains_nul => return error.OutDirPathContainsNul,
+        .contains_backslash => return error.OutDirPathContainsBackslash,
+        .contains_dotdot => return error.OutDirPathContainsDotDot,
+    }
+}
+
+fn validatePostsDirPath(posts_dir_path: []const u8) !void {
+    switch (relDirPathIssue(posts_dir_path)) {
+        .ok => return,
+        .empty_or_dot => return error.InvalidPostsDirPath,
+        .absolute => return error.PostsDirPathMustBeRelative,
+        .contains_nul => return error.PostsDirPathContainsNul,
+        .contains_backslash => return error.PostsDirPathContainsBackslash,
+        .contains_dotdot => return error.PostsDirPathContainsDotDot,
+    }
+}
+
+fn validateStaticDirPath(static_dir_path: []const u8) !void {
+    switch (relDirPathIssue(static_dir_path)) {
+        .ok => return,
+        .empty_or_dot => return error.InvalidStaticDirPath,
+        .absolute => return error.StaticDirPathMustBeRelative,
+        .contains_nul => return error.StaticDirPathContainsNul,
+        .contains_backslash => return error.StaticDirPathContainsBackslash,
+        .contains_dotdot => return error.StaticDirPathContainsDotDot,
     }
 }
 
@@ -343,22 +395,60 @@ fn cleanDist(out_dir: std.fs.Dir) !void {
     }
 }
 
-fn validateStaticAndOutDirs(
+fn validateInputAndOutDirs(
     allocator: std.mem.Allocator,
     base_dir: std.fs.Dir,
     out_dir_path: []const u8,
+    posts_dir_path: []const u8,
     static_dir_path: []const u8,
 ) !void {
+    const base_abs = try base_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base_abs);
+
     const out_abs = try base_dir.realpathAlloc(allocator, out_dir_path);
     defer allocator.free(out_abs);
 
-    const static_abs = base_dir.realpathAlloc(allocator, static_dir_path) catch |err| switch (err) {
+    try validateExistingInputDirWithinBase(allocator, base_dir, base_abs, out_abs, posts_dir_path, .posts);
+    try validateExistingInputDirWithinBase(allocator, base_dir, base_abs, out_abs, static_dir_path, .static);
+}
+
+const InputDirKind = enum {
+    posts,
+    static,
+};
+
+fn validateExistingInputDirWithinBase(
+    allocator: std.mem.Allocator,
+    base_dir: std.fs.Dir,
+    base_abs: []const u8,
+    out_abs: []const u8,
+    dir_path: []const u8,
+    kind: InputDirKind,
+) !void {
+    const dir_abs = base_dir.realpathAlloc(allocator, dir_path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer allocator.free(static_abs);
+    defer allocator.free(dir_abs);
 
-    if (pathsOverlap(out_abs, static_abs)) return error.StaticDirOverlapsOutDir;
+    if (std.mem.eql(u8, base_abs, dir_abs)) {
+        return switch (kind) {
+            .posts => error.PostsDirIsBaseDir,
+            .static => error.StaticDirIsBaseDir,
+        };
+    }
+    if (!pathContains(base_abs, dir_abs)) {
+        return switch (kind) {
+            .posts => error.PostsDirEscapesBaseDir,
+            .static => error.StaticDirEscapesBaseDir,
+        };
+    }
+    if (pathsOverlap(out_abs, dir_abs)) {
+        return switch (kind) {
+            .posts => error.PostsDirOverlapsOutDir,
+            .static => error.StaticDirOverlapsOutDir,
+        };
+    }
 }
 
 fn pathsOverlap(a: []const u8, b: []const u8) bool {
@@ -424,7 +514,7 @@ fn copyDirRecursive(allocator: std.mem.Allocator, src_root: std.fs.Dir, dst_root
         while (try it.next()) |entry| {
             if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
             switch (entry.kind) {
-                .file => try src_dir.copyFile(entry.name, dst_dir, entry.name, .{}),
+                .file => try copyFileAtomic(src_dir, entry.name, dst_dir, entry.name),
                 .directory => {
                     try dst_dir.makePath(entry.name);
 
@@ -441,6 +531,25 @@ fn copyDirRecursive(allocator: std.mem.Allocator, src_root: std.fs.Dir, dst_root
             }
         }
     }
+}
+
+fn copyFileAtomic(src_dir: std.fs.Dir, src_name: []const u8, dst_dir: std.fs.Dir, dst_name: []const u8) !void {
+    var src_file = try src_dir.openFile(src_name, .{});
+    defer src_file.close();
+
+    var write_buf: [16 * 1024]u8 = undefined;
+    var out_file = try dst_dir.atomicFile(dst_name, .{ .write_buffer = &write_buf });
+    defer out_file.deinit();
+
+    var read_buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try src_file.readAll(&read_buf);
+        if (n == 0) break;
+        try out_file.file_writer.interface.writeAll(read_buf[0..n]);
+        if (n < read_buf.len) break;
+    }
+
+    try out_file.finish();
 }
 
 fn generatePostPage(
@@ -695,9 +804,79 @@ test "generate rejects overlapping static and output directories" {
         .log_warnings = false,
     }));
 
-    try testing.expectError(error.StaticDirOverlapsOutDir, generate(testing.allocator, tmp.dir, .{
+    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, tmp.dir, .{
         .out_dir_path = "dist",
         .static_dir_path = ".",
+        .log_warnings = false,
+    }));
+}
+
+test "generate rejects unsafe posts_dir_path" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(error.InvalidPostsDirPath, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = "" }));
+    try testing.expectError(error.InvalidPostsDirPath, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = "." }));
+    try testing.expectError(error.PostsDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = ".." }));
+    try testing.expectError(error.PostsDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = "posts/../oops" }));
+}
+
+test "generate rejects unsafe static_dir_path" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, tmp.dir, .{ .static_dir_path = "" }));
+    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, tmp.dir, .{ .static_dir_path = "." }));
+    try testing.expectError(error.StaticDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .static_dir_path = ".." }));
+    try testing.expectError(error.StaticDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .static_dir_path = "static/../oops" }));
+}
+
+test "generate rejects overlapping posts and output directories" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(error.PostsDirOverlapsOutDir, generate(testing.allocator, tmp.dir, .{
+        .out_dir_path = "dist",
+        .posts_dir_path = "dist",
+        .log_warnings = false,
+    }));
+}
+
+test "generate rejects input directories that resolve outside base dir" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_abs = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base_abs);
+
+    const parent_abs = std.fs.path.dirname(base_abs) orelse return error.TestExpectedEqual;
+    var parent_dir = try std.fs.openDirAbsolute(parent_abs, .{});
+    defer parent_dir.close();
+
+    try parent_dir.makePath("outside-static");
+    defer parent_dir.deleteTree("outside-static") catch {};
+    try tmp.dir.symLink("../outside-static", "static", .{ .is_directory = true });
+
+    try parent_dir.makePath("outside-posts");
+    defer parent_dir.deleteTree("outside-posts") catch {};
+    try tmp.dir.symLink("../outside-posts", "posts", .{ .is_directory = true });
+
+    try testing.expectError(error.StaticDirEscapesBaseDir, generate(testing.allocator, tmp.dir, .{
+        .static_dir_path = "static",
+        .posts_dir_path = "posts_ok",
+        .log_warnings = false,
+    }));
+    try testing.expectError(error.PostsDirEscapesBaseDir, generate(testing.allocator, tmp.dir, .{
+        .posts_dir_path = "posts",
+        .static_dir_path = "static_ok",
         .log_warnings = false,
     }));
 }

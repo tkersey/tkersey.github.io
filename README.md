@@ -26,8 +26,11 @@ zig build serve
 ## Development
 
 ```bash
-zig fmt build.zig src/*.zig
+zig fmt --check build.zig src/*.zig
 zig build test
+
+# Autoformat
+zig fmt build.zig src/*.zig
 ```
 
 ## Work tracking
