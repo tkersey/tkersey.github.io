@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,9 +15,15 @@ concurrency:
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
+      - name: Ensure deploy is from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Deploy Pages runs only from main; got '$GITHUB_REF'." >&2
+            exit 1
+          fi
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
@@ -31,7 +38,7 @@ jobs:
           path: dist
 
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-24.04
     permissions:

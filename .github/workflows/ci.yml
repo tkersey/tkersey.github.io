@@ -26,6 +26,7 @@ jobs:
     needs: zig
     runs-on: ubuntu-24.04
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -70,3 +71,49 @@ jobs:
               pull_number: prNumber,
               merge_method: "squash",
             });
+
+            const pagesWorkflowId = "pages.yml";
+            const pagesRef = "main";
+            const dispatchMaxAttempts = 5;
+
+            function formatOctokitError(err) {
+              if (!err) return "unknown error";
+              const status = err.status ? `HTTP ${err.status}` : "HTTP ?";
+              const message = (() => {
+                if (err.message) return err.message;
+                if (typeof err === "string") return err;
+                try {
+                  return JSON.stringify(err);
+                } catch {
+                  return String(err);
+                }
+              })();
+              return `${status}: ${message}`;
+            }
+
+            core.info(`Dispatching Pages deploy workflow after merge.`);
+            for (let attempt = 1; attempt <= dispatchMaxAttempts; attempt++) {
+              if (attempt > 1) {
+                const delayMs = 1000 * attempt * attempt;
+                core.info(`Retrying dispatch in ${delayMs}ms (attempt ${attempt}/${dispatchMaxAttempts}).`);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+              }
+
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner,
+                  repo,
+                  workflow_id: pagesWorkflowId,
+                  ref: pagesRef,
+                });
+                core.info(`Pages deploy workflow dispatched (attempt ${attempt}/${dispatchMaxAttempts}).`);
+                break;
+              } catch (e) {
+                core.warning(`Dispatch attempt ${attempt}/${dispatchMaxAttempts} failed: ${formatOctokitError(e)}`);
+                if (attempt === dispatchMaxAttempts) {
+                  throw new Error(
+                    `Failed to dispatch Pages deploy workflow '${pagesWorkflowId}' on '${pagesRef}': ${formatOctokitError(e)}`,
+                  );
+                }
+              }
+            }
