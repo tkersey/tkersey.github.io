@@ -146,7 +146,7 @@ fn generatePostPage(
         \\<main>
     );
 
-    const html = try markdown_renderer.renderHtml(allocator, markdown);
+    const html = try markdown_renderer.renderHtmlAlloc(allocator, markdown);
     defer allocator.free(html);
     try w.interface.writeAll(html);
     try w.interface.writeAll("\n</main>\n");

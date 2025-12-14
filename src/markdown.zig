@@ -6,10 +6,21 @@ const c = @cImport({
     @cInclude("cmark-gfm-extension_api.h");
 });
 
-pub fn renderHtml(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
+fn ensureCoreExtensionsRegistered() void {
     c.cmark_gfm_core_extensions_ensure_registered();
+}
 
-    const options: c_int = c.CMARK_OPT_DEFAULT;
+var core_extensions_once = std.once(ensureCoreExtensionsRegistered);
+
+/// Render Markdown as an HTML fragment.
+/// Returns an owned slice; caller must free it with `allocator.free`.
+pub fn renderHtmlAlloc(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
+    core_extensions_once.call();
+
+    const mem = c.cmark_get_default_mem_allocator();
+    const free_fn = mem.*.free orelse return error.MissingDefaultAllocatorFree;
+
+    const options: c_int = c.CMARK_OPT_DEFAULT | c.CMARK_OPT_VALIDATE_UTF8;
     const parser = c.cmark_parser_new(options) orelse return error.OutOfMemory;
     defer c.cmark_parser_free(parser);
 
@@ -31,10 +42,24 @@ pub fn renderHtml(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
 
     const syntax_extensions = c.cmark_parser_get_syntax_extensions(parser);
     const rendered = c.cmark_render_html(doc, options, syntax_extensions) orelse return error.RenderFailed;
-    defer {
-        const mem = c.cmark_get_default_mem_allocator();
-        mem.*.free.?(@ptrCast(rendered));
-    }
+    defer free_fn(@ptrCast(rendered));
 
     return allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(rendered))));
+}
+
+test "renderHtmlAlloc scrubs raw HTML and dangerous URLs" {
+    const testing = std.testing;
+
+    const input =
+        \\<script>alert(1)</script>
+        \\
+        \\[x](javascript:alert(1))
+        \\
+    ;
+
+    const html = try renderHtmlAlloc(testing.allocator, input);
+    defer testing.allocator.free(html);
+
+    try testing.expect(std.mem.indexOf(u8, html, "<script") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "javascript:") == null);
 }

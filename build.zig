@@ -49,15 +49,17 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
 
-    inline for (.{ "src/cli.zig", "src/site.zig", "src/server.zig", "src/front_matter.zig" }) |test_root| {
+    inline for (.{ "src/cli.zig", "src/site.zig", "src/server.zig", "src/front_matter.zig", "src/markdown.zig" }) |test_root| {
         const test_module = b.createModule(.{
             .root_source_file = b.path(test_root),
             .target = host_target,
             .optimize = optimize,
             .link_libc = true,
         });
-        test_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm"));
-        test_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm-extensions"));
+        if (std.mem.eql(u8, test_root, "src/cli.zig") or std.mem.eql(u8, test_root, "src/site.zig") or std.mem.eql(u8, test_root, "src/markdown.zig")) {
+            test_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm"));
+            test_module.linkLibrary(cmark_gfm_pkg.artifact("cmark-gfm-extensions"));
+        }
         const test_exe = b.addTest(.{ .root_module = test_module });
         const run_test = b.addRunArtifact(test_exe);
         test_step.dependOn(&run_test.step);
