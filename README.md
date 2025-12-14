@@ -33,6 +33,27 @@ zig build test
 zig fmt build.zig src/*.zig
 ```
 
+## GitHub Pages
+
+This repo deploys via `.github/workflows/pages.yml` using GitHub Actions.
+
+Prereqs:
+- The repo must support Pages (public, or a plan that supports private Pages).
+- Settings → Pages → Build and deployment → Source = GitHub Actions.
+
+Useful commands:
+```bash
+# Check Pages status (404 means not enabled yet)
+gh api -i repos/tkersey/tkersey.github.io/pages
+
+# Enable Pages with Actions as the build type
+gh api -X POST repos/tkersey/tkersey.github.io/pages -f build_type=workflow
+
+# Re-run the latest Deploy Pages workflow run (after enabling Pages)
+gh run list --workflow pages.yml --limit 1
+gh run rerun <run-id>
+```
+
 ## Work tracking
 
 This repo uses `bd` (beads). See `AGENTS.md` and `.beads/BD_GUIDE.md`.
