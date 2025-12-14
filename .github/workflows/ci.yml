@@ -26,6 +26,7 @@ jobs:
     needs: zig
     runs-on: ubuntu-24.04
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -70,3 +71,16 @@ jobs:
               pull_number: prNumber,
               merge_method: "squash",
             });
+
+            core.info(`Dispatching Pages deploy workflow after merge.`);
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: "pages.yml",
+                ref: "main",
+              });
+              core.info("Pages deploy workflow dispatched.");
+            } catch (e) {
+              core.warning(`Failed to dispatch Pages deploy workflow: ${e}`);
+            }
