@@ -4,6 +4,73 @@ const site = @import("site.zig");
 const server = @import("server.zig");
 const watch = @import("watch.zig");
 
+const site_config_path: []const u8 = "site.yml";
+
+const SiteConfig = struct {
+    raw: ?[]u8 = null,
+
+    title: []const u8 = "Blog",
+    description: []const u8 = "",
+    author: ?[]const u8 = null,
+    base_url: []const u8 = "https://tkersey.github.io",
+    posts_dir: []const u8 = "posts",
+    static_dir: []const u8 = "static",
+    dist_dir: []const u8 = "dist",
+
+    pub fn deinit(self: *SiteConfig, allocator: std.mem.Allocator) void {
+        if (self.raw) |buf| allocator.free(buf);
+    }
+};
+
+fn loadSiteConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !SiteConfig {
+    const raw = base_dir.readFileAlloc(allocator, site_config_path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    errdefer allocator.free(raw);
+
+    var config: SiteConfig = .{ .raw = raw };
+
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |raw_line| {
+        const trimmed = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') continue;
+
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const key = std.mem.trimRight(u8, trimmed[0..colon], " \t");
+        var value = std.mem.trimLeft(u8, trimmed[colon + 1 ..], " \t");
+        value = stripInlineComment(value);
+        const scalar = parseScalar(value);
+        if (scalar.len == 0) continue;
+
+        if (std.mem.eql(u8, key, "title")) config.title = scalar;
+        if (std.mem.eql(u8, key, "description")) config.description = scalar;
+        if (std.mem.eql(u8, key, "author")) config.author = scalar;
+        if (std.mem.eql(u8, key, "base_url")) config.base_url = scalar;
+        if (std.mem.eql(u8, key, "posts_dir")) config.posts_dir = scalar;
+        if (std.mem.eql(u8, key, "static_dir")) config.static_dir = scalar;
+        if (std.mem.eql(u8, key, "dist_dir")) config.dist_dir = scalar;
+    }
+
+    return config;
+}
+
+fn generateFromConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir, log_warnings: bool) !void {
+    var config = try loadSiteConfig(allocator, base_dir);
+    defer config.deinit(allocator);
+
+    try site.generate(allocator, base_dir, .{
+        .out_dir_path = config.dist_dir,
+        .posts_dir_path = config.posts_dir,
+        .static_dir_path = config.static_dir,
+        .site_title = config.title,
+        .site_description = config.description,
+        .base_url = config.base_url,
+        .log_warnings = log_warnings,
+    });
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     base_dir: std.fs.Dir,
@@ -23,8 +90,17 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, cmd, "build")) {
-        try site.generate(allocator, base_dir, .{});
-        try stdout.print("Generated site in dist/\n", .{});
+        var config = try loadSiteConfig(allocator, base_dir);
+        defer config.deinit(allocator);
+        try site.generate(allocator, base_dir, .{
+            .out_dir_path = config.dist_dir,
+            .posts_dir_path = config.posts_dir,
+            .static_dir_path = config.static_dir,
+            .site_title = config.title,
+            .site_description = config.description,
+            .base_url = config.base_url,
+        });
+        try stdout.print("Generated site in {s}/\n", .{config.dist_dir});
         return 0;
     }
 
@@ -82,8 +158,18 @@ pub fn run(
             }
         }
 
-        try site.generate(allocator, base_dir, .{});
-        try stdout.print("Serving dist/ at http://{s}:{d}/\n", .{ host, port });
+        var config = try loadSiteConfig(allocator, base_dir);
+        defer config.deinit(allocator);
+
+        try site.generate(allocator, base_dir, .{
+            .out_dir_path = config.dist_dir,
+            .posts_dir_path = config.posts_dir,
+            .static_dir_path = config.static_dir,
+            .site_title = config.title,
+            .site_description = config.description,
+            .base_url = config.base_url,
+        });
+        try stdout.print("Serving {s}/ at http://{s}:{d}/\n", .{ config.dist_dir, host, port });
         if (watch_enabled) {
             const max_poll_ms: u64 = 60_000;
             if (poll_ms > max_poll_ms) {
@@ -124,7 +210,7 @@ pub fn run(
 
             if (watcher_started) try stdout.print("Watching for changes (polling every {d}ms)\n", .{poll_ms});
         }
-        try server.serve(base_dir, .{ .host = host, .port = port });
+        try server.serve(base_dir, .{ .host = host, .port = port, .out_dir_path = config.dist_dir });
         return 0;
     }
 
@@ -188,12 +274,48 @@ fn watchThreadMain(args: WatchThreadArgs) void {
         pending = null;
 
         std.log.info("Change detected; rebuilding...", .{});
-        site.generate(allocator, base_dir, .{}) catch |err| {
+        generateFromConfig(allocator, base_dir, true) catch |err| {
             std.log.err("Rebuild failed: {s}", .{@errorName(err)});
             continue;
         };
         std.log.info("Rebuild complete.", .{});
     }
+}
+
+fn stripInlineComment(value: []const u8) []const u8 {
+    const trimmed = std.mem.trimRight(u8, value, " \t");
+    if (trimmed.len == 0) return trimmed;
+
+    if (trimmed[0] == '"' or trimmed[0] == '\'') {
+        const quote = trimmed[0];
+        const end_quote = findClosingQuote(trimmed, quote) orelse return trimmed;
+        const after = std.mem.trimLeft(u8, trimmed[end_quote + 1 ..], " \t");
+        if (after.len == 0 or after[0] == '#') return trimmed[0 .. end_quote + 1];
+        return trimmed;
+    }
+
+    const hash = std.mem.indexOfScalar(u8, trimmed, '#') orelse return trimmed;
+    if (hash == 0) return "";
+    if (!std.ascii.isWhitespace(trimmed[hash - 1])) return trimmed;
+    return std.mem.trimRight(u8, trimmed[0..hash], " \t");
+}
+
+fn findClosingQuote(value: []const u8, quote: u8) ?usize {
+    var i: usize = 1;
+    while (i < value.len) : (i += 1) {
+        if (value[i] != quote) continue;
+        if (i > 0 and value[i - 1] == '\\') continue;
+        return i;
+    }
+    return null;
+}
+
+fn parseScalar(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len >= 2 and ((trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') or (trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\''))) {
+        return trimmed[1 .. trimmed.len - 1];
+    }
+    return trimmed;
 }
 
 test "serve arg parsing rejects missing values" {

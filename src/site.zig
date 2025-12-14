@@ -7,7 +7,25 @@ pub const GenerateOptions = struct {
     out_dir_path: []const u8 = "dist",
     posts_dir_path: []const u8 = "posts",
     static_dir_path: []const u8 = "static",
+    site_title: []const u8 = "Blog",
+    site_description: []const u8 = "",
+    base_url: []const u8 = "https://tkersey.github.io",
     log_warnings: bool = true,
+};
+
+const PostSummary = struct {
+    title: []const u8,
+    date: front_matter.Date,
+    date_raw: []const u8,
+    slug: []const u8,
+    description: ?[]const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.title);
+        alloc.free(self.date_raw);
+        alloc.free(self.slug);
+        if (self.description) |d| alloc.free(d);
+    }
 };
 
 pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: GenerateOptions) !void {
@@ -27,19 +45,6 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         else => return err,
     };
     defer if (posts_dir) |*d| d.close();
-
-    const PostSummary = struct {
-        title: []const u8,
-        date: front_matter.Date,
-        date_raw: []const u8,
-        slug: []const u8,
-
-        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            alloc.free(self.title);
-            alloc.free(self.date_raw);
-            alloc.free(self.slug);
-        }
-    };
 
     var posts: std.ArrayListUnmanaged(PostSummary) = .{};
     defer {
@@ -123,6 +128,10 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
                 .date = parsed.front_matter.date,
                 .date_raw = try allocator.dupe(u8, parsed.front_matter.date_raw),
                 .slug = slug,
+                .description = if (parsed.front_matter.description) |desc|
+                    try allocator.dupe(u8, desc)
+                else
+                    null,
             });
         }
     }
@@ -137,13 +146,15 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
     };
     std.mem.sortUnstable(PostSummary, posts.items, PostsSortContext{}, PostsSortContext.lessThan);
 
+    try generateFeedXml(out_dir, options, posts.items);
+
     var index_buf: [16 * 1024]u8 = undefined;
     var index_file = try out_dir.atomicFile("index.html", .{
         .write_buffer = &index_buf,
     });
     defer index_file.deinit();
 
-    try writeDocumentStart(&index_file.file_writer.interface, "Blog");
+    try writeDocumentStart(&index_file.file_writer.interface, options.site_title);
     try index_file.file_writer.interface.writeAll("<main>\n<h1>Posts</h1>\n<ul>\n");
     for (posts.items) |post| {
         try index_file.file_writer.interface.writeAll("<li><a href=\"");
@@ -159,6 +170,113 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
     try index_file.file_writer.interface.writeAll("</ul>\n</main>\n");
     try writeDocumentEnd(&index_file.file_writer.interface);
     try index_file.finish();
+}
+
+fn generateFeedXml(out_dir: std.fs.Dir, options: GenerateOptions, posts: []const PostSummary) !void {
+    var buf: [16 * 1024]u8 = undefined;
+    var feed_file = try out_dir.atomicFile("feed.xml", .{ .write_buffer = &buf });
+    defer feed_file.deinit();
+
+    try feed_file.file_writer.interface.writeAll("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    try feed_file.file_writer.interface.writeAll("<rss version=\"2.0\">\n<channel>\n");
+
+    try feed_file.file_writer.interface.writeAll("<title>");
+    try writeEscapedXml(&feed_file.file_writer.interface, options.site_title);
+    try feed_file.file_writer.interface.writeAll("</title>\n");
+
+    try feed_file.file_writer.interface.writeAll("<link>");
+    try writeEscapedXml(&feed_file.file_writer.interface, std.mem.trimRight(u8, options.base_url, "/"));
+    try feed_file.file_writer.interface.writeAll("</link>\n");
+
+    try feed_file.file_writer.interface.writeAll("<description>");
+    try writeEscapedXml(&feed_file.file_writer.interface, options.site_description);
+    try feed_file.file_writer.interface.writeAll("</description>\n");
+
+    if (posts.len != 0) {
+        try feed_file.file_writer.interface.writeAll("<lastBuildDate>");
+        try writeRfc822Date(&feed_file.file_writer.interface, posts[0].date);
+        try feed_file.file_writer.interface.writeAll("</lastBuildDate>\n");
+    }
+
+    try feed_file.file_writer.interface.writeAll("<generator>blog</generator>\n");
+
+    for (posts) |post| {
+        try feed_file.file_writer.interface.writeAll("<item>\n<title>");
+        try writeEscapedXml(&feed_file.file_writer.interface, post.title);
+        try feed_file.file_writer.interface.writeAll("</title>\n<link>");
+        try writePostUrl(&feed_file.file_writer.interface, options.base_url, post.slug);
+        try feed_file.file_writer.interface.writeAll("</link>\n<guid isPermaLink=\"true\">");
+        try writePostUrl(&feed_file.file_writer.interface, options.base_url, post.slug);
+        try feed_file.file_writer.interface.writeAll("</guid>\n<pubDate>");
+        try writeRfc822Date(&feed_file.file_writer.interface, post.date);
+        try feed_file.file_writer.interface.writeAll("</pubDate>\n");
+
+        if (post.description) |desc| {
+            try feed_file.file_writer.interface.writeAll("<description>");
+            try writeEscapedXml(&feed_file.file_writer.interface, desc);
+            try feed_file.file_writer.interface.writeAll("</description>\n");
+        }
+
+        try feed_file.file_writer.interface.writeAll("</item>\n");
+    }
+
+    try feed_file.file_writer.interface.writeAll("</channel>\n</rss>\n");
+    try feed_file.finish();
+}
+
+fn writePostUrl(w: *std.Io.Writer, base_url: []const u8, slug: []const u8) !void {
+    const base = std.mem.trimRight(u8, base_url, "/");
+    try writeEscapedXml(w, base);
+    try w.writeAll("/");
+    try writeEscapedXml(w, slug);
+    try w.writeAll(".html");
+}
+
+fn writeRfc822Date(w: *std.Io.Writer, date: front_matter.Date) !void {
+    const weekday_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const wd: usize = weekdayForDate(date);
+    const month = month_names[@intCast(date.month - 1)];
+
+    var tmp: [64]u8 = undefined;
+    const s = try std.fmt.bufPrint(
+        &tmp,
+        "{s}, {d:0>2} {s} {d} 00:00:00 GMT",
+        .{ weekday_names[wd], date.day, month, date.year },
+    );
+    try w.writeAll(s);
+}
+
+fn weekdayForDate(date: front_matter.Date) usize {
+    const t = [_]i32{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    var y: i32 = date.year;
+    const m: i32 = date.month;
+    const d: i32 = date.day;
+    if (m < 3) y -= 1;
+    const idx: usize = @intCast(m - 1);
+    const dow: i32 = y + @divTrunc(y, @as(i32, 4)) - @divTrunc(y, @as(i32, 100)) + @divTrunc(y, @as(i32, 400)) + t[idx] + d;
+    return @intCast(@mod(dow, @as(i32, 7)));
+}
+
+fn writeEscapedXml(w: *std.Io.Writer, input: []const u8) !void {
+    var start: usize = 0;
+    for (input, 0..) |c, i| {
+        const escaped: ?[]const u8 = switch (c) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&apos;",
+            else => null,
+        };
+        if (escaped) |esc| {
+            if (i > start) try w.writeAll(input[start..i]);
+            try w.writeAll(esc);
+            start = i + 1;
+        }
+    }
+    if (start < input.len) try w.writeAll(input[start..]);
 }
 
 fn cleanDist(out_dir: std.fs.Dir) !void {
@@ -465,6 +583,39 @@ test "generate sorts posts" {
     const a_pos = std.mem.indexOf(u8, index, "href=\"a.html\"") orelse return error.TestExpectedEqual;
     const b_pos = std.mem.indexOf(u8, index, "href=\"b.html\"") orelse return error.TestExpectedEqual;
     try testing.expect(b_pos < a_pos);
+}
+
+test "generate writes feed.xml with correct base_url, dates, and descriptions" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("posts");
+    try tmp.dir.writeFile(.{ .sub_path = "posts/one.md", .data = 
+        \\---
+        \\title: One & <Two>
+        \\date: 2025-12-13
+        \\description: Desc & <b>
+        \\---
+        \\one
+    });
+
+    try generate(testing.allocator, tmp.dir, .{
+        .base_url = "https://example.com/blog",
+        .site_title = "Example",
+        .site_description = "Example desc",
+    });
+
+    const feed = try tmp.dir.readFileAlloc(testing.allocator, "dist/feed.xml", 1024 * 1024);
+    defer testing.allocator.free(feed);
+
+    try testing.expect(std.mem.indexOf(u8, feed, "<rss version=\"2.0\">") != null);
+    try testing.expect(std.mem.indexOf(u8, feed, "<link>https://example.com/blog</link>") != null);
+    try testing.expect(std.mem.indexOf(u8, feed, "<link>https://example.com/blog/one.html</link>") != null);
+    try testing.expect(std.mem.indexOf(u8, feed, "<pubDate>Sat, 13 Dec 2025 00:00:00 GMT</pubDate>") != null);
+    try testing.expect(std.mem.indexOf(u8, feed, "<description>Desc &amp; &lt;b&gt;</description>") != null);
+    try testing.expect(std.mem.indexOf(u8, feed, "<title>One &amp; &lt;Two&gt;</title>") != null);
 }
 
 test "generate rejects overlapping static and output directories" {
