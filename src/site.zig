@@ -6,6 +6,7 @@ const markdown_renderer = @import("markdown.zig");
 pub const GenerateOptions = struct {
     out_dir_path: []const u8 = "dist",
     posts_dir_path: []const u8 = "posts",
+    static_dir_path: []const u8 = "static",
 };
 
 pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: GenerateOptions) !void {
@@ -16,26 +17,32 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
 
     try cleanDist(out_dir);
 
+    try copyStaticAssets(base_dir, out_dir, options.static_dir_path);
+
     var posts_dir = base_dir.openDir(options.posts_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
     defer if (posts_dir) |*d| d.close();
 
-    var index_file = try out_dir.createFile("index.html", .{ .truncate = true });
-    defer index_file.close();
+    const PostSummary = struct {
+        title: []const u8,
+        date: front_matter.Date,
+        date_raw: []const u8,
+        slug: []const u8,
 
-    var index_buf: [16 * 1024]u8 = undefined;
-    var index_writer = index_file.writer(&index_buf);
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.title);
+            alloc.free(self.date_raw);
+            alloc.free(self.slug);
+        }
+    };
 
-    try index_writer.interface.writeAll(
-        \\<!doctype html>
-        \\<meta charset="utf-8">
-        \\<title>Blog</title>
-        \\<h1>Posts</h1>
-        \\<ul>
-        \\
-    );
+    var posts: std.ArrayListUnmanaged(PostSummary) = .{};
+    defer {
+        for (posts.items) |*post| post.deinit(allocator);
+        posts.deinit(allocator);
+    }
 
     if (posts_dir) |*pd| {
         var post_names: std.ArrayList([]const u8) = .empty;
@@ -59,11 +66,7 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         std.mem.sortUnstable([]const u8, post_names.items, SortContext{}, SortContext.lessThan);
 
         var slug_owners: std.StringHashMapUnmanaged([]const u8) = .{};
-        defer {
-            var it_slugs = slug_owners.iterator();
-            while (it_slugs.next()) |kv| allocator.free(kv.key_ptr.*);
-            slug_owners.deinit(allocator);
-        }
+        defer slug_owners.deinit(allocator);
 
         for (post_names.items) |md_name| {
             const stem = md_name[0 .. md_name.len - 3];
@@ -95,20 +98,51 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
             const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug});
             defer allocator.free(html_name);
 
-            generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.body) catch |err| {
+            generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.front_matter.date_raw, parsed.body) catch |err| {
                 std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
                 return err;
             };
 
-            try index_writer.interface.writeAll("<li><a href=\"/");
-            try writeEscapedHtml(&index_writer.interface, html_name);
-            try index_writer.interface.writeAll("\">");
-            try writeEscapedHtml(&index_writer.interface, parsed.front_matter.title);
-            try index_writer.interface.writeAll("</a></li>\n");
+            try posts.append(allocator, .{
+                .title = try allocator.dupe(u8, parsed.front_matter.title),
+                .date = parsed.front_matter.date,
+                .date_raw = try allocator.dupe(u8, parsed.front_matter.date_raw),
+                .slug = slug,
+            });
         }
     }
 
-    try index_writer.interface.writeAll("</ul>\n");
+    const PostsSortContext = struct {
+        pub fn lessThan(_: @This(), a: PostSummary, b: PostSummary) bool {
+            if (a.date.year != b.date.year) return a.date.year > b.date.year;
+            if (a.date.month != b.date.month) return a.date.month > b.date.month;
+            if (a.date.day != b.date.day) return a.date.day > b.date.day;
+            return std.mem.lessThan(u8, a.slug, b.slug);
+        }
+    };
+    std.mem.sortUnstable(PostSummary, posts.items, PostsSortContext{}, PostsSortContext.lessThan);
+
+    var index_file = try out_dir.createFile("index.html", .{ .truncate = true });
+    defer index_file.close();
+
+    var index_buf: [16 * 1024]u8 = undefined;
+    var index_writer = index_file.writer(&index_buf);
+
+    try writeDocumentStart(&index_writer.interface, "Blog");
+    try index_writer.interface.writeAll("<main>\n<h1>Posts</h1>\n<ul>\n");
+    for (posts.items) |post| {
+        try index_writer.interface.writeAll("<li><a href=\"/");
+        try writeEscapedHtml(&index_writer.interface, post.slug);
+        try index_writer.interface.writeAll(".html\">");
+        try writeEscapedHtml(&index_writer.interface, post.title);
+        try index_writer.interface.writeAll("</a> <small><time datetime=\"");
+        try writeEscapedHtml(&index_writer.interface, post.date_raw);
+        try index_writer.interface.writeAll("\">");
+        try writeEscapedHtml(&index_writer.interface, post.date_raw);
+        try index_writer.interface.writeAll("</time></small></li>\n");
+    }
+    try index_writer.interface.writeAll("</ul>\n</main>\n");
+    try writeDocumentEnd(&index_writer.interface);
     try index_writer.interface.flush();
 }
 
@@ -124,11 +158,43 @@ fn cleanDist(out_dir: std.fs.Dir) !void {
     }
 }
 
+fn copyStaticAssets(base_dir: std.fs.Dir, out_dir: std.fs.Dir, static_dir_path: []const u8) !void {
+    var static_dir = base_dir.openDir(static_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer static_dir.close();
+
+    try copyDirRecursive(static_dir, out_dir);
+}
+
+fn copyDirRecursive(src_dir: std.fs.Dir, dst_dir: std.fs.Dir) !void {
+    var it = src_dir.iterate();
+    while (try it.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
+        switch (entry.kind) {
+            .file => try src_dir.copyFile(entry.name, dst_dir, entry.name, .{}),
+            .directory => {
+                try dst_dir.makePath(entry.name);
+
+                var src_child = try src_dir.openDir(entry.name, .{ .iterate = true });
+                defer src_child.close();
+                var dst_child = try dst_dir.openDir(entry.name, .{ .iterate = true });
+                defer dst_child.close();
+
+                try copyDirRecursive(src_child, dst_child);
+            },
+            else => continue,
+        }
+    }
+}
+
 fn generatePostPage(
     allocator: std.mem.Allocator,
     out_dir: std.fs.Dir,
     out_name: []const u8,
     title: []const u8,
+    date_raw: []const u8,
     markdown: []const u8,
 ) !void {
     var out_file = try out_dir.createFile(out_name, .{ .truncate = true });
@@ -137,23 +203,48 @@ fn generatePostPage(
     var buf: [16 * 1024]u8 = undefined;
     var w = out_file.writer(&buf);
 
-    try w.interface.writeAll(
-        \\<!doctype html>
-        \\<meta charset="utf-8">
-        \\<title>
-    );
+    try writeDocumentStart(&w.interface, title);
+    try w.interface.writeAll("<main>\n<p><a href=\"/\">Back</a></p>\n<h1>");
     try writeEscapedHtml(&w.interface, title);
-    try w.interface.writeAll(
-        \\</title>
-        \\<p><a href="/index.html">Back</a></p>
-        \\<main>
-    );
+    try w.interface.writeAll("</h1>\n<p><small><time datetime=\"");
+    try writeEscapedHtml(&w.interface, date_raw);
+    try w.interface.writeAll("\">");
+    try writeEscapedHtml(&w.interface, date_raw);
+    try w.interface.writeAll("</time></small></p>\n<article>\n");
 
     const html = try markdown_renderer.renderHtmlAlloc(allocator, markdown);
     defer allocator.free(html);
     try w.interface.writeAll(html);
-    try w.interface.writeAll("\n</main>\n");
+    try w.interface.writeAll("\n</article>\n</main>\n");
+    try writeDocumentEnd(&w.interface);
     try w.interface.flush();
+}
+
+fn writeDocumentStart(w: *std.Io.Writer, title: []const u8) !void {
+    try w.writeAll(
+        \\<!doctype html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<link rel="stylesheet" href="/style.css">
+        \\<title>
+    );
+    try writeEscapedHtml(w, title);
+    try w.writeAll(
+        \\</title>
+        \\</head>
+        \\<body>
+        \\
+    );
+}
+
+fn writeDocumentEnd(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\</body>
+        \\</html>
+        \\
+    );
 }
 
 fn writeEscapedHtml(w: *std.Io.Writer, input: []const u8) !void {
@@ -270,7 +361,7 @@ test "generate sorts posts" {
 
     const a_pos = std.mem.indexOf(u8, index, "/a.html") orelse return error.TestExpectedEqual;
     const b_pos = std.mem.indexOf(u8, index, "/b.html") orelse return error.TestExpectedEqual;
-    try testing.expect(a_pos < b_pos);
+    try testing.expect(b_pos < a_pos);
 }
 
 test "generate skips drafts" {
@@ -345,7 +436,7 @@ test "generatePostPage renders markdown to HTML" {
     var dist = try tmp.dir.openDir("dist", .{ .iterate = true });
     defer dist.close();
 
-    try generatePostPage(testing.allocator, dist, "post.html", "Post",
+    try generatePostPage(testing.allocator, dist, "post.html", "Post", "2025-12-01",
         \\# Hello
         \\
         \\This is **bold**.
@@ -359,8 +450,34 @@ test "generatePostPage renders markdown to HTML" {
     const html = try tmp.dir.readFileAlloc(testing.allocator, "dist/post.html", 1024 * 1024);
     defer testing.allocator.free(html);
 
+    try testing.expect(std.mem.indexOf(u8, html, "href=\"/style.css\"") != null);
     try testing.expect(std.mem.indexOf(u8, html, "<h1") != null);
     try testing.expect(std.mem.indexOf(u8, html, "Hello") != null);
     try testing.expect(std.mem.indexOf(u8, html, "<strong>bold</strong>") != null);
     try testing.expect(std.mem.indexOf(u8, html, "<table") != null);
+}
+
+test "generate copies static assets" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("static/images");
+    try tmp.dir.writeFile(.{ .sub_path = "static/style.css", .data = "body{}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "static/images/logo.png", .data = "x" });
+
+    try tmp.dir.makePath("posts");
+    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = 
+        \\---
+        \\title: A
+        \\date: 2025-12-01
+        \\---
+        \\hi
+    });
+
+    try generate(testing.allocator, tmp.dir, .{});
+
+    try tmp.dir.access("dist/style.css", .{});
+    try tmp.dir.access("dist/images/logo.png", .{});
 }
