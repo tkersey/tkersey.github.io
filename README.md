@@ -19,8 +19,57 @@ Edit `site.yml` to set site metadata (`title`, `description`, `base_url`) and di
 # Generate the site into dist/
 zig build
 
-# Serve dist/ locally (watches and rebuilds on changes)
+# Serve dist/ locally (optional watch + rebuild on changes)
 zig build serve
+```
+
+## Write + publish a post
+
+1) Create a new file under `posts/` with YAML front matter:
+
+```yaml
+---
+title: My Post Title
+date: "2025-12-14" # YYYY-MM-DD
+slug: my-post # recommended (keeps the URL stable across renames)
+description: Optional short summary
+tags:
+  - zig
+  - meta
+---
+```
+
+Notes:
+- `draft: true` hides a post from generation.
+- Without `slug:`, the generator uses the filename stem (`posts/<stem>.md` → `/<stem>.html`).
+
+2) Preview locally:
+
+```bash
+zig build
+zig build serve
+```
+
+3) Publish via PR (auto-merge):
+
+```bash
+git checkout -b blog-my-post
+git add posts/<file>.md static/<optional-assets>
+git commit -m "Add post: <title> (blog-...)"
+git push -u origin blog-my-post
+
+# Open a PR and mark it for auto-merge after CI passes
+gh pr create --fill --label auto-merge
+```
+
+4) Verify deploy + live site:
+
+```bash
+gh run list --workflow pages.yml --branch main --limit 1
+gh run watch <run-id> --compact --exit-status --interval 10
+
+curl -fsS -H "Cache-Control: no-cache" https://tkersey.github.io/ | rg -q "<Title>"
+curl -fsS -H "Cache-Control: no-cache" https://tkersey.github.io/feed.xml | rg -q "<slug>"
 ```
 
 ## Development
