@@ -13,9 +13,12 @@ pub const WatchTargets = struct {
 pub fn fingerprint(allocator: std.mem.Allocator, base_dir: std.fs.Dir, targets: WatchTargets) !u64 {
     var acc: FingerprintAcc = .{};
 
-    try addDirTreeFingerprint(allocator, base_dir, targets.posts_dir_path, &acc);
-    try addDirTreeFingerprint(allocator, base_dir, targets.static_dir_path, &acc);
-    try addDirTreeFingerprint(allocator, base_dir, targets.templates_dir_path, &acc);
+    const base_abs = try base_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base_abs);
+
+    try addDirTreeFingerprint(allocator, base_dir, base_abs, targets.posts_dir_path, &acc);
+    try addDirTreeFingerprint(allocator, base_dir, base_abs, targets.static_dir_path, &acc);
+    try addDirTreeFingerprint(allocator, base_dir, base_abs, targets.templates_dir_path, &acc);
     try addFileFingerprint(base_dir, targets.site_config_path, &acc);
 
     return acc.final();
@@ -63,14 +66,28 @@ fn addFileFingerprint(base_dir: std.fs.Dir, path: []const u8, acc: *FingerprintA
     acc.add(hashFile(path, stat, content_hash));
 }
 
-fn addDirTreeFingerprint(allocator: std.mem.Allocator, base_dir: std.fs.Dir, dir_path: []const u8, acc: *FingerprintAcc) !void {
-    var root = base_dir.openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+fn addDirTreeFingerprint(
+    allocator: std.mem.Allocator,
+    base_dir: std.fs.Dir,
+    base_abs: []const u8,
+    dir_path: []const u8,
+    acc: *FingerprintAcc,
+) !void {
+    try validateWatchTargetDirPath(dir_path);
+
+    const dir_abs = base_dir.realpathAlloc(allocator, dir_path) catch |err| switch (err) {
         error.FileNotFound => {
             acc.add(hashSentinel(dir_path, .missing_dir));
             return;
         },
         else => return err,
     };
+    defer allocator.free(dir_abs);
+
+    if (std.mem.eql(u8, dir_abs, base_abs)) return error.WatchTargetIsBaseDir;
+    if (!pathContains(base_abs, dir_abs)) return error.WatchTargetEscapesBaseDir;
+
+    var root = try base_dir.openDir(dir_path, .{ .iterate = true });
     defer root.close();
 
     acc.add(hashSentinel(dir_path, .present_dir));
@@ -129,6 +146,37 @@ fn addDirTreeFingerprint(allocator: std.mem.Allocator, base_dir: std.fs.Dir, dir
             }
         }
     }
+}
+
+fn validateWatchTargetDirPath(path: []const u8) !void {
+    const trimmed = trimTrailingSeps(std.mem.trim(u8, path, " \t"));
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) return error.InvalidWatchTargetPath;
+    if (std.fs.path.isAbsolute(trimmed)) return error.InvalidWatchTargetPath;
+    if (std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.InvalidWatchTargetPath;
+    if (std.mem.indexOfScalar(u8, trimmed, '\\') != null) return error.InvalidWatchTargetPath;
+
+    var it = std.mem.splitScalar(u8, trimmed, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (std.mem.eql(u8, segment, ".")) continue;
+        if (std.mem.eql(u8, segment, "..")) return error.InvalidWatchTargetPath;
+    }
+}
+
+fn pathContains(parent_path: []const u8, child_path: []const u8) bool {
+    const parent = trimTrailingSeps(parent_path);
+    const child = trimTrailingSeps(child_path);
+
+    if (std.mem.eql(u8, parent, child)) return true;
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    return std.fs.path.isSep(child[parent.len]);
+}
+
+fn trimTrailingSeps(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and std.fs.path.isSep(path[end - 1])) : (end -= 1) {}
+    return path[0..end];
 }
 
 const SentinelKind = enum(u8) {
@@ -306,4 +354,42 @@ test "fingerprint changes when a symlink target changes" {
     const b = try fingerprint(testing.allocator, tmp.dir, .{});
 
     try testing.expect(a != b);
+}
+
+test "fingerprint rejects invalid watch target paths" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(
+        error.InvalidWatchTargetPath,
+        fingerprint(testing.allocator, tmp.dir, .{ .posts_dir_path = ".." }),
+    );
+}
+
+test "fingerprint rejects watch targets that escape the base dir" {
+    const testing = std.testing;
+    const builtin = @import("builtin");
+
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_abs = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base_abs);
+
+    const parent_abs = std.fs.path.dirname(base_abs) orelse return error.TestExpectedEqual;
+    var parent_dir = try std.fs.openDirAbsolute(parent_abs, .{});
+    defer parent_dir.close();
+
+    try parent_dir.makePath("outside-watch");
+    defer parent_dir.deleteTree("outside-watch") catch {};
+    try tmp.dir.symLink("../outside-watch", "posts", .{ .is_directory = true });
+
+    try testing.expectError(
+        error.WatchTargetEscapesBaseDir,
+        fingerprint(testing.allocator, tmp.dir, .{ .posts_dir_path = "posts" }),
+    );
 }
