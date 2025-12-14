@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const front_matter = @import("front_matter.zig");
+const markdown_renderer = @import("markdown.zig");
 
 pub const GenerateOptions = struct {
     out_dir_path: []const u8 = "dist",
@@ -94,7 +95,10 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
             const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug});
             defer allocator.free(html_name);
 
-            try generatePostPage(out_dir, html_name, parsed.front_matter.title, parsed.body);
+            generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.body) catch |err| {
+                std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
+                return err;
+            };
 
             try index_writer.interface.writeAll("<li><a href=\"/");
             try writeEscapedHtml(&index_writer.interface, html_name);
@@ -121,10 +125,11 @@ fn cleanDist(out_dir: std.fs.Dir) !void {
 }
 
 fn generatePostPage(
+    allocator: std.mem.Allocator,
     out_dir: std.fs.Dir,
     out_name: []const u8,
     title: []const u8,
-    md: []const u8,
+    markdown: []const u8,
 ) !void {
     var out_file = try out_dir.createFile(out_name, .{ .truncate = true });
     defer out_file.close();
@@ -141,12 +146,13 @@ fn generatePostPage(
     try w.interface.writeAll(
         \\</title>
         \\<p><a href="/index.html">Back</a></p>
-        \\<pre>
-        \\
+        \\<main>
     );
 
-    try writeEscapedHtml(&w.interface, md);
-    try w.interface.writeAll("\n</pre>\n");
+    const html = try markdown_renderer.renderHtmlAlloc(allocator, markdown);
+    defer allocator.free(html);
+    try w.interface.writeAll(html);
+    try w.interface.writeAll("\n</main>\n");
     try w.interface.flush();
 }
 
@@ -327,4 +333,34 @@ test "generate errors on duplicate slugs" {
     });
 
     try testing.expectError(error.DuplicateSlug, generate(testing.allocator, tmp.dir, .{}));
+}
+
+test "generatePostPage renders markdown to HTML" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("dist");
+    var dist = try tmp.dir.openDir("dist", .{ .iterate = true });
+    defer dist.close();
+
+    try generatePostPage(testing.allocator, dist, "post.html", "Post",
+        \\# Hello
+        \\
+        \\This is **bold**.
+        \\
+        \\| a | b |
+        \\|---|---|
+        \\| 1 | 2 |
+        \\
+    );
+
+    const html = try tmp.dir.readFileAlloc(testing.allocator, "dist/post.html", 1024 * 1024);
+    defer testing.allocator.free(html);
+
+    try testing.expect(std.mem.indexOf(u8, html, "<h1") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "Hello") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<strong>bold</strong>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<table") != null);
 }
