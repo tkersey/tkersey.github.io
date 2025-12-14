@@ -17,10 +17,12 @@ var core_extensions_once = std.once(ensureCoreExtensionsRegistered);
 pub fn renderHtmlAlloc(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
     core_extensions_once.call();
 
+    if (!std.unicode.utf8ValidateSlice(markdown)) return error.InvalidUtf8;
+
     const mem = c.cmark_get_default_mem_allocator();
     const free_fn = mem.*.free orelse return error.MissingDefaultAllocatorFree;
 
-    const options: c_int = c.CMARK_OPT_DEFAULT | c.CMARK_OPT_VALIDATE_UTF8;
+    const options: c_int = c.CMARK_OPT_DEFAULT;
     const parser = c.cmark_parser_new(options) orelse return error.OutOfMemory;
     defer c.cmark_parser_free(parser);
 
@@ -62,4 +64,10 @@ test "renderHtmlAlloc scrubs raw HTML and dangerous URLs" {
 
     try testing.expect(std.mem.indexOf(u8, html, "<script") == null);
     try testing.expect(std.mem.indexOf(u8, html, "javascript:") == null);
+}
+
+test "renderHtmlAlloc rejects invalid UTF-8" {
+    const testing = std.testing;
+
+    try testing.expectError(error.InvalidUtf8, renderHtmlAlloc(testing.allocator, "abc\xc0"));
 }

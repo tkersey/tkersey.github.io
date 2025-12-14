@@ -95,7 +95,10 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
             const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug});
             defer allocator.free(html_name);
 
-            try generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.body);
+            generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.body) catch |err| {
+                std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
+                return err;
+            };
 
             try index_writer.interface.writeAll("<li><a href=\"/");
             try writeEscapedHtml(&index_writer.interface, html_name);
