@@ -7,6 +7,7 @@ pub const GenerateOptions = struct {
     out_dir_path: []const u8 = "dist",
     posts_dir_path: []const u8 = "posts",
     static_dir_path: []const u8 = "static",
+    log_warnings: bool = true,
 };
 
 pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: GenerateOptions) !void {
@@ -15,9 +16,11 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
     var out_dir = try base_dir.openDir(options.out_dir_path, .{ .iterate = true });
     defer out_dir.close();
 
+    try validateStaticAndOutDirs(allocator, base_dir, options.out_dir_path, options.static_dir_path);
+
     try cleanDist(out_dir);
 
-    try copyStaticAssets(base_dir, out_dir, options.static_dir_path);
+    try copyStaticAssets(allocator, base_dir, out_dir, options.static_dir_path);
 
     var posts_dir = base_dir.openDir(options.posts_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -66,18 +69,23 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         std.mem.sortUnstable([]const u8, post_names.items, SortContext{}, SortContext.lessThan);
 
         var slug_owners: std.StringHashMapUnmanaged([]const u8) = .{};
-        defer slug_owners.deinit(allocator);
+        var slug_owner_keys: std.ArrayListUnmanaged([]u8) = .{};
+        defer {
+            for (slug_owner_keys.items) |key| allocator.free(key);
+            slug_owner_keys.deinit(allocator);
+            slug_owners.deinit(allocator);
+        }
 
         for (post_names.items) |md_name| {
             const stem = md_name[0 .. md_name.len - 3];
 
             const md = pd.readFileAlloc(allocator, md_name, 10 * 1024 * 1024) catch |err| {
-                std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
+                if (options.log_warnings) std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
                 return err;
             };
 
             var parsed = front_matter.parseOwnedBuffer(allocator, md) catch |err| {
-                std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
+                if (options.log_warnings) std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
                 return err;
             };
             defer parsed.deinit(allocator);
@@ -86,20 +94,27 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
             const base_slug_input = parsed.front_matter.slug orelse stem;
             const slug = try slugify(allocator, base_slug_input);
             if (slug_owners.get(slug)) |owner| {
-                std.log.warn(
-                    "duplicate slug '{s}' for posts/{s} (already used by posts/{s})",
-                    .{ slug, md_name, owner },
-                );
+                if (options.log_warnings) {
+                    std.log.warn(
+                        "duplicate slug '{s}' for posts/{s} (already used by posts/{s})",
+                        .{ slug, md_name, owner },
+                    );
+                }
                 allocator.free(slug);
                 return error.DuplicateSlug;
             }
-            try slug_owners.put(allocator, slug, md_name);
+            const slug_key = try allocator.dupe(u8, slug);
+            slug_owner_keys.append(allocator, slug_key) catch |err| {
+                allocator.free(slug_key);
+                return err;
+            };
+            try slug_owners.put(allocator, slug_key, md_name);
 
             const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug});
             defer allocator.free(html_name);
 
             generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.front_matter.date_raw, parsed.body) catch |err| {
-                std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
+                if (options.log_warnings) std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
                 return err;
             };
 
@@ -131,7 +146,7 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
     try writeDocumentStart(&index_writer.interface, "Blog");
     try index_writer.interface.writeAll("<main>\n<h1>Posts</h1>\n<ul>\n");
     for (posts.items) |post| {
-        try index_writer.interface.writeAll("<li><a href=\"/");
+        try index_writer.interface.writeAll("<li><a href=\"");
         try writeEscapedHtml(&index_writer.interface, post.slug);
         try index_writer.interface.writeAll(".html\">");
         try writeEscapedHtml(&index_writer.interface, post.title);
@@ -151,40 +166,108 @@ fn cleanDist(out_dir: std.fs.Dir) !void {
     while (try it.next()) |entry| {
         if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
         switch (entry.kind) {
-            .file => try out_dir.deleteFile(entry.name),
             .directory => try out_dir.deleteTree(entry.name),
-            else => try out_dir.deleteTree(entry.name),
+            else => try out_dir.deleteFile(entry.name),
         }
     }
 }
 
-fn copyStaticAssets(base_dir: std.fs.Dir, out_dir: std.fs.Dir, static_dir_path: []const u8) !void {
+fn validateStaticAndOutDirs(
+    allocator: std.mem.Allocator,
+    base_dir: std.fs.Dir,
+    out_dir_path: []const u8,
+    static_dir_path: []const u8,
+) !void {
+    const out_abs = try base_dir.realpathAlloc(allocator, out_dir_path);
+    defer allocator.free(out_abs);
+
+    const static_abs = base_dir.realpathAlloc(allocator, static_dir_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(static_abs);
+
+    if (pathsOverlap(out_abs, static_abs)) return error.StaticDirOverlapsOutDir;
+}
+
+fn pathsOverlap(a: []const u8, b: []const u8) bool {
+    return pathContains(a, b) or pathContains(b, a);
+}
+
+fn pathContains(parent_path: []const u8, child_path: []const u8) bool {
+    const parent = trimTrailingSeps(parent_path);
+    const child = trimTrailingSeps(child_path);
+
+    if (std.mem.eql(u8, parent, child)) return true;
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    return std.fs.path.isSep(child[parent.len]);
+}
+
+fn trimTrailingSeps(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and std.fs.path.isSep(path[end - 1])) : (end -= 1) {}
+    return path[0..end];
+}
+
+fn copyStaticAssets(allocator: std.mem.Allocator, base_dir: std.fs.Dir, out_dir: std.fs.Dir, static_dir_path: []const u8) !void {
     var static_dir = base_dir.openDir(static_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
     defer static_dir.close();
 
-    try copyDirRecursive(static_dir, out_dir);
+    try copyDirRecursive(allocator, static_dir, out_dir);
 }
 
-fn copyDirRecursive(src_dir: std.fs.Dir, dst_dir: std.fs.Dir) !void {
-    var it = src_dir.iterate();
-    while (try it.next()) |entry| {
-        if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
-        switch (entry.kind) {
-            .file => try src_dir.copyFile(entry.name, dst_dir, entry.name, .{}),
-            .directory => {
-                try dst_dir.makePath(entry.name);
+fn copyDirRecursive(allocator: std.mem.Allocator, src_root: std.fs.Dir, dst_root: std.fs.Dir) !void {
+    var stack: std.ArrayListUnmanaged([]u8) = .{};
+    defer {
+        for (stack.items) |p| allocator.free(p);
+        stack.deinit(allocator);
+    }
 
-                var src_child = try src_dir.openDir(entry.name, .{ .iterate = true });
-                defer src_child.close();
-                var dst_child = try dst_dir.openDir(entry.name, .{ .iterate = true });
-                defer dst_child.close();
+    const root_rel_path = try allocator.dupe(u8, "");
+    stack.append(allocator, root_rel_path) catch |err| {
+        allocator.free(root_rel_path);
+        return err;
+    };
 
-                try copyDirRecursive(src_child, dst_child);
-            },
-            else => continue,
+    while (stack.pop()) |rel_path| {
+        defer allocator.free(rel_path);
+
+        var src_dir: std.fs.Dir = src_root;
+        var dst_dir: std.fs.Dir = dst_root;
+        var close_dirs = false;
+        if (rel_path.len != 0) {
+            src_dir = try src_root.openDir(rel_path, .{ .iterate = true });
+            dst_dir = try dst_root.openDir(rel_path, .{ .iterate = true });
+            close_dirs = true;
+        }
+        defer if (close_dirs) {
+            src_dir.close();
+            dst_dir.close();
+        };
+
+        var it = src_dir.iterate();
+        while (try it.next()) |entry| {
+            if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
+            switch (entry.kind) {
+                .file => try src_dir.copyFile(entry.name, dst_dir, entry.name, .{}),
+                .directory => {
+                    try dst_dir.makePath(entry.name);
+
+                    const child_rel_path = child_rel_path: {
+                        if (rel_path.len == 0) break :child_rel_path try allocator.dupe(u8, entry.name);
+                        break :child_rel_path try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ rel_path, std.fs.path.sep, entry.name });
+                    };
+                    stack.append(allocator, child_rel_path) catch |err| {
+                        allocator.free(child_rel_path);
+                        return err;
+                    };
+                },
+                else => continue,
+            }
         }
     }
 }
@@ -204,7 +287,7 @@ fn generatePostPage(
     var w = out_file.writer(&buf);
 
     try writeDocumentStart(&w.interface, title);
-    try w.interface.writeAll("<main>\n<p><a href=\"/\">Back</a></p>\n<h1>");
+    try w.interface.writeAll("<main>\n<p><a href=\"index.html\">Back</a></p>\n<h1>");
     try writeEscapedHtml(&w.interface, title);
     try w.interface.writeAll("</h1>\n<p><small><time datetime=\"");
     try writeEscapedHtml(&w.interface, date_raw);
@@ -227,7 +310,7 @@ fn writeDocumentStart(w: *std.Io.Writer, title: []const u8) !void {
         \\<head>
         \\<meta charset="utf-8">
         \\<meta name="viewport" content="width=device-width, initial-scale=1">
-        \\<link rel="stylesheet" href="/style.css">
+        \\<link rel="stylesheet" href="style.css">
         \\<title>
     );
     try writeEscapedHtml(w, title);
@@ -313,6 +396,28 @@ test "cleanDist preserves .gitignore" {
     try testing.expectError(error.FileNotFound, dist.access("old.html", .{}));
 }
 
+test "cleanDist does not follow symlinks" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("dist");
+    try tmp.dir.makePath("victim");
+    try tmp.dir.writeFile(.{ .sub_path = "victim/keep.txt", .data = "keep\n" });
+
+    var dist = try tmp.dir.openDir("dist", .{ .iterate = true });
+    defer dist.close();
+
+    try dist.writeFile(.{ .sub_path = ".gitignore", .data = "*\n" });
+    try dist.symLink("../victim", "victim_link", .{ .is_directory = true });
+
+    try cleanDist(dist);
+
+    try tmp.dir.access("victim/keep.txt", .{});
+    try testing.expectError(error.FileNotFound, dist.access("victim_link", .{}));
+}
+
 test "writeEscapedHtml escapes special characters" {
     const testing = std.testing;
 
@@ -359,9 +464,28 @@ test "generate sorts posts" {
     const index = try tmp.dir.readFileAlloc(testing.allocator, "dist/index.html", 1024 * 1024);
     defer testing.allocator.free(index);
 
-    const a_pos = std.mem.indexOf(u8, index, "/a.html") orelse return error.TestExpectedEqual;
-    const b_pos = std.mem.indexOf(u8, index, "/b.html") orelse return error.TestExpectedEqual;
+    const a_pos = std.mem.indexOf(u8, index, "href=\"a.html\"") orelse return error.TestExpectedEqual;
+    const b_pos = std.mem.indexOf(u8, index, "href=\"b.html\"") orelse return error.TestExpectedEqual;
     try testing.expect(b_pos < a_pos);
+}
+
+test "generate rejects overlapping static and output directories" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(error.StaticDirOverlapsOutDir, generate(testing.allocator, tmp.dir, .{
+        .out_dir_path = "dist",
+        .static_dir_path = "dist",
+        .log_warnings = false,
+    }));
+
+    try testing.expectError(error.StaticDirOverlapsOutDir, generate(testing.allocator, tmp.dir, .{
+        .out_dir_path = "dist",
+        .static_dir_path = ".",
+        .log_warnings = false,
+    }));
 }
 
 test "generate skips drafts" {
@@ -423,7 +547,7 @@ test "generate errors on duplicate slugs" {
         \\hi
     });
 
-    try testing.expectError(error.DuplicateSlug, generate(testing.allocator, tmp.dir, .{}));
+    try testing.expectError(error.DuplicateSlug, generate(testing.allocator, tmp.dir, .{ .log_warnings = false }));
 }
 
 test "generatePostPage renders markdown to HTML" {
@@ -450,7 +574,7 @@ test "generatePostPage renders markdown to HTML" {
     const html = try tmp.dir.readFileAlloc(testing.allocator, "dist/post.html", 1024 * 1024);
     defer testing.allocator.free(html);
 
-    try testing.expect(std.mem.indexOf(u8, html, "href=\"/style.css\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "href=\"style.css\"") != null);
     try testing.expect(std.mem.indexOf(u8, html, "<h1") != null);
     try testing.expect(std.mem.indexOf(u8, html, "Hello") != null);
     try testing.expect(std.mem.indexOf(u8, html, "<strong>bold</strong>") != null);
