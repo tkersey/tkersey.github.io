@@ -137,28 +137,28 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
     };
     std.mem.sortUnstable(PostSummary, posts.items, PostsSortContext{}, PostsSortContext.lessThan);
 
-    var index_file = try out_dir.createFile("index.html", .{ .truncate = true });
-    defer index_file.close();
-
     var index_buf: [16 * 1024]u8 = undefined;
-    var index_writer = index_file.writer(&index_buf);
+    var index_file = try out_dir.atomicFile("index.html", .{
+        .write_buffer = &index_buf,
+    });
+    defer index_file.deinit();
 
-    try writeDocumentStart(&index_writer.interface, "Blog");
-    try index_writer.interface.writeAll("<main>\n<h1>Posts</h1>\n<ul>\n");
+    try writeDocumentStart(&index_file.file_writer.interface, "Blog");
+    try index_file.file_writer.interface.writeAll("<main>\n<h1>Posts</h1>\n<ul>\n");
     for (posts.items) |post| {
-        try index_writer.interface.writeAll("<li><a href=\"");
-        try writeEscapedHtml(&index_writer.interface, post.slug);
-        try index_writer.interface.writeAll(".html\">");
-        try writeEscapedHtml(&index_writer.interface, post.title);
-        try index_writer.interface.writeAll("</a> <small><time datetime=\"");
-        try writeEscapedHtml(&index_writer.interface, post.date_raw);
-        try index_writer.interface.writeAll("\">");
-        try writeEscapedHtml(&index_writer.interface, post.date_raw);
-        try index_writer.interface.writeAll("</time></small></li>\n");
+        try index_file.file_writer.interface.writeAll("<li><a href=\"");
+        try writeEscapedHtml(&index_file.file_writer.interface, post.slug);
+        try index_file.file_writer.interface.writeAll(".html\">");
+        try writeEscapedHtml(&index_file.file_writer.interface, post.title);
+        try index_file.file_writer.interface.writeAll("</a> <small><time datetime=\"");
+        try writeEscapedHtml(&index_file.file_writer.interface, post.date_raw);
+        try index_file.file_writer.interface.writeAll("\">");
+        try writeEscapedHtml(&index_file.file_writer.interface, post.date_raw);
+        try index_file.file_writer.interface.writeAll("</time></small></li>\n");
     }
-    try index_writer.interface.writeAll("</ul>\n</main>\n");
-    try writeDocumentEnd(&index_writer.interface);
-    try index_writer.interface.flush();
+    try index_file.file_writer.interface.writeAll("</ul>\n</main>\n");
+    try writeDocumentEnd(&index_file.file_writer.interface);
+    try index_file.finish();
 }
 
 fn cleanDist(out_dir: std.fs.Dir) !void {
@@ -280,27 +280,25 @@ fn generatePostPage(
     date_raw: []const u8,
     markdown: []const u8,
 ) !void {
-    var out_file = try out_dir.createFile(out_name, .{ .truncate = true });
-    defer out_file.close();
-
     var buf: [16 * 1024]u8 = undefined;
-    var w = out_file.writer(&buf);
+    var out_file = try out_dir.atomicFile(out_name, .{ .write_buffer = &buf });
+    defer out_file.deinit();
 
-    try writeDocumentStart(&w.interface, title);
-    try w.interface.writeAll("<main>\n<p><a href=\"index.html\">Back</a></p>\n<h1>");
-    try writeEscapedHtml(&w.interface, title);
-    try w.interface.writeAll("</h1>\n<p><small><time datetime=\"");
-    try writeEscapedHtml(&w.interface, date_raw);
-    try w.interface.writeAll("\">");
-    try writeEscapedHtml(&w.interface, date_raw);
-    try w.interface.writeAll("</time></small></p>\n<article>\n");
+    try writeDocumentStart(&out_file.file_writer.interface, title);
+    try out_file.file_writer.interface.writeAll("<main>\n<p><a href=\"index.html\">Back</a></p>\n<h1>");
+    try writeEscapedHtml(&out_file.file_writer.interface, title);
+    try out_file.file_writer.interface.writeAll("</h1>\n<p><small><time datetime=\"");
+    try writeEscapedHtml(&out_file.file_writer.interface, date_raw);
+    try out_file.file_writer.interface.writeAll("\">");
+    try writeEscapedHtml(&out_file.file_writer.interface, date_raw);
+    try out_file.file_writer.interface.writeAll("</time></small></p>\n<article>\n");
 
     const html = try markdown_renderer.renderHtmlAlloc(allocator, markdown);
     defer allocator.free(html);
-    try w.interface.writeAll(html);
-    try w.interface.writeAll("\n</article>\n</main>\n");
-    try writeDocumentEnd(&w.interface);
-    try w.interface.flush();
+    try out_file.file_writer.interface.writeAll(html);
+    try out_file.file_writer.interface.writeAll("\n</article>\n</main>\n");
+    try writeDocumentEnd(&out_file.file_writer.interface);
+    try out_file.finish();
 }
 
 fn writeDocumentStart(w: *std.Io.Writer, title: []const u8) !void {

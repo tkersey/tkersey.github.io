@@ -32,7 +32,7 @@ pub fn run(
         var host: []const u8 = "127.0.0.1";
         var port: u16 = 8080;
         var watch_enabled = true;
-        var poll_ms: u64 = 250;
+        var poll_ms: u64 = 500;
         var idx: usize = 2;
         while (idx < args.len) : (idx += 1) {
             const arg = args[idx];
@@ -85,15 +85,44 @@ pub fn run(
         try site.generate(allocator, base_dir, .{});
         try stdout.print("Serving dist/ at http://{s}:{d}/\n", .{ host, port });
         if (watch_enabled) {
-            const poll_ns = poll_ms * std.time.ns_per_ms;
-            const thread_args: WatchThreadArgs = .{
-                .base_dir = base_dir,
-                .poll_interval_ns = poll_ns,
-                .targets = .{},
+            const max_poll_ms: u64 = 60_000;
+            if (poll_ms > max_poll_ms) {
+                try stderr.print("error: --poll-ms must be <= {d}\n\n", .{max_poll_ms});
+                try printUsage(stderr);
+                return 2;
+            }
+
+            const poll_ns = std.math.mul(u64, poll_ms, std.time.ns_per_ms) catch {
+                try stderr.writeAll("error: --poll-ms is too large\n\n");
+                try printUsage(stderr);
+                return 2;
             };
-            const thread = try std.Thread.spawn(.{}, watchThreadMain, .{thread_args});
-            thread.detach();
-            try stdout.print("Watching for changes (polling every {d}ms)\n", .{poll_ms});
+
+            var watcher_started = false;
+            if (base_dir.openDir(".", .{ .iterate = true })) |dir| {
+                var watch_dir = dir;
+                defer watch_dir.close();
+
+                if (watch.fingerprint(allocator, watch_dir, .{})) |_| {
+                    const thread_args: WatchThreadArgs = .{
+                        .base_dir = base_dir,
+                        .poll_interval_ns = poll_ns,
+                        .targets = .{},
+                    };
+                    if (std.Thread.spawn(.{}, watchThreadMain, .{thread_args})) |thread| {
+                        thread.detach();
+                        watcher_started = true;
+                    } else |err| {
+                        try stderr.print("warning: watcher disabled ({s})\n", .{@errorName(err)});
+                    }
+                } else |err| {
+                    try stderr.print("warning: watcher disabled ({s})\n", .{@errorName(err)});
+                }
+            } else |err| {
+                try stderr.print("warning: watcher disabled ({s})\n", .{@errorName(err)});
+            }
+
+            if (watcher_started) try stdout.print("Watching for changes (polling every {d}ms)\n", .{poll_ms});
         }
         try server.serve(base_dir, .{ .host = host, .port = port });
         return 0;
@@ -108,7 +137,7 @@ fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage:
         \\  blog build
-        \\  blog serve [--host 127.0.0.1] [--port 8080] [--no-watch] [--poll-ms 250]
+        \\  blog serve [--host 127.0.0.1] [--port 8080] [--no-watch] [--poll-ms 500]
         \\  blog help
         \\
         \\Zig build steps:
@@ -134,20 +163,29 @@ fn watchThreadMain(args: WatchThreadArgs) void {
     };
     defer base_dir.close();
 
-    var prev = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
+    var stable = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
         std.log.err("watch: initial fingerprint failed: {s}", .{@errorName(err)});
         return;
     };
 
+    var pending: ?u64 = null;
     while (true) {
         std.Thread.sleep(args.poll_interval_ns);
 
-        const next = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
+        const current = watch.fingerprint(allocator, base_dir, args.targets) catch |err| {
             std.log.err("watch: fingerprint failed: {s}", .{@errorName(err)});
             continue;
         };
-        if (next == prev) continue;
-        prev = next;
+        if (current == stable) {
+            pending = null;
+            continue;
+        }
+        if (pending == null or pending.? != current) {
+            pending = current;
+            continue;
+        }
+        stable = current;
+        pending = null;
 
         std.log.info("Change detected; rebuilding...", .{});
         site.generate(allocator, base_dir, .{}) catch |err| {
