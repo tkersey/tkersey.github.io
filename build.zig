@@ -44,12 +44,15 @@ pub fn build(b: *std.Build) void {
     const serve_cmd = b.addRunArtifact(exe);
     serve_cmd.step.dependOn(b.getInstallStep());
     serve_cmd.addArg("serve");
+    if (b.args) |args| {
+        serve_cmd.addArgs(args);
+    }
     const serve_step = b.step("serve", "Serve dist/ locally");
     serve_step.dependOn(&serve_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
 
-    inline for (.{ "src/cli.zig", "src/site.zig", "src/server.zig", "src/front_matter.zig", "src/markdown.zig" }) |test_root| {
+    inline for (.{ "src/cli.zig", "src/site.zig", "src/server.zig", "src/front_matter.zig", "src/markdown.zig", "src/watch.zig" }) |test_root| {
         const test_module = b.createModule(.{
             .root_source_file = b.path(test_root),
             .target = host_target,
