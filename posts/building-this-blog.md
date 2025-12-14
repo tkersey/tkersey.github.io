@@ -1,6 +1,7 @@
 ---
 title: Building this blog (in Zig)
 date: "2025-12-14"
+slug: building-this-blog
 description: Notes on a small Zig static-site blog and deploying it to GitHub Pages
 tags:
   - meta
@@ -57,7 +58,7 @@ zig build
 zig build serve
 ```
 
-`serve` rebuilds as files change so I can keep the feedback loop tight.
+With watch enabled, `serve` rebuilds on changes (polling) so I can keep the feedback loop tight.
 
 ## Deploy
 
