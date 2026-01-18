@@ -628,7 +628,7 @@ fn writeEscapedHtml(w: *std.Io.Writer, input: []const u8) !void {
     if (start < input.len) try w.writeAll(input[start..]);
 }
 
-fn slugify(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+pub fn slugify(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 

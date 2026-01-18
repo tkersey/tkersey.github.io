@@ -72,6 +72,37 @@ curl -fsS -H "Cache-Control: no-cache" https://tkersey.github.io/ | rg -q "<Titl
 curl -fsS -H "Cache-Control: no-cache" https://tkersey.github.io/feed.xml | rg -q "<slug>"
 ```
 
+## LinkedIn auto-posting (optional)
+
+Local usage:
+```bash
+zig build run -- linkedin auth   # interactive OAuth, saves .env
+zig build run -- linkedin --file posts/hello-world.md
+```
+If `LINKEDIN_AUTHOR_URN`/`LINKEDIN_PERSON_ID` are unset, the CLI will call `/v2/me` to resolve your author URN (requires `r_liteprofile` on the token).
+The auth flow prompts for `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, and a redirect URI (default `http://127.0.0.1:8123/linkedin/callback`) and writes them plus the access token to `.env`.
+`.env` is gitignored.
+The CLI loads `.env` automatically.
+
+Batch from a git range (useful in CI):
+```bash
+zig build run -- linkedin --changed HEAD~1
+```
+
+Dry-run (no API calls):
+```bash
+zig build run -- linkedin --dry-run
+```
+
+Resolve your author URN automatically (prints export lines):
+```bash
+zig build run -- linkedin --whoami
+```
+
+CI setup (GitHub Actions):
+- Add `LINKEDIN_ACCESS_TOKEN` as a repo secret. If the token lacks `r_liteprofile`, also add `LINKEDIN_AUTHOR_URN` (or `LINKEDIN_PERSON_ID`).
+- The Pages workflow will post any changed non-draft posts on pushes to `main`.
+
 ## Development
 
 ```bash

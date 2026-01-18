@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
 
-    inline for (.{ "src/cli.zig", "src/site.zig", "src/server.zig", "src/front_matter.zig", "src/markdown.zig", "src/watch.zig" }) |test_root| {
+    inline for (.{ "src/cli.zig", "src/site.zig", "src/server.zig", "src/front_matter.zig", "src/markdown.zig", "src/watch.zig", "src/linkedin.zig" }) |test_root| {
         const test_module = b.createModule(.{
             .root_source_file = b.path(test_root),
             .target = host_target,
