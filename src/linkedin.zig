@@ -57,11 +57,12 @@ pub const FetchAuthorResult = struct {
 
 pub fn loadPost(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    base_dir: std.Io.Dir,
     path: []const u8,
     base_url: []const u8,
 ) !?Post {
-    const raw = try base_dir.readFileAlloc(allocator, path, max_post_bytes);
+    const raw = try base_dir.readFileAlloc(io, path, allocator, .limited(max_post_bytes));
     var parsed = front_matter.parseOwnedBuffer(allocator, raw) catch |err| {
         allocator.free(raw);
         return err;
@@ -77,7 +78,7 @@ pub fn loadPost(
     const slug = try site.slugify(allocator, base_slug_input);
     errdefer allocator.free(slug);
 
-    const trimmed_base = std.mem.trimRight(u8, base_url, "/");
+    const trimmed_base = std.mem.trimEnd(u8, base_url, "/");
     const url = try std.fmt.allocPrint(allocator, "{s}/{s}.html", .{ trimmed_base, slug });
     errdefer allocator.free(url);
 
@@ -94,27 +95,28 @@ pub fn loadPost(
 
 pub fn findLatestPost(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    base_dir: std.Io.Dir,
     posts_dir: []const u8,
     base_url: []const u8,
 ) !?Post {
-    var dir = base_dir.openDir(posts_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = base_dir.openDir(io, posts_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var it = dir.iterate();
     var best: ?Post = null;
 
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
 
         const rel_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ posts_dir, entry.name });
         defer allocator.free(rel_path);
 
-        const maybe_post = try loadPost(allocator, base_dir, rel_path, base_url);
+        const maybe_post = try loadPost(allocator, io, base_dir, rel_path, base_url);
         if (maybe_post == null) continue;
 
         var post = maybe_post.?;
@@ -449,9 +451,10 @@ test "fuzz truncateUtf8InPlace never leaves invalid utf8" {
     const testing = std.testing;
 
     try testing.fuzz(testing.allocator, struct {
-        fn run(allocator: std.mem.Allocator, input: []const u8) !void {
-            const max_len = @min(input.len, 4096);
-            const slice = input[0..max_len];
+        fn run(allocator: std.mem.Allocator, smith: *std.testing.Smith) !void {
+            var buf: [4096]u8 = undefined;
+            const len = smith.slice(&buf);
+            const slice = buf[0..len];
 
             var list: std.ArrayList(u8) = .empty;
             defer list.deinit(allocator);

@@ -28,30 +28,30 @@ const PostSummary = struct {
     }
 };
 
-pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: GenerateOptions) !void {
+pub fn generate(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir, options: GenerateOptions) !void {
     try validateOutDirPath(options.out_dir_path);
     try validatePostsDirPath(options.posts_dir_path);
     try validateStaticDirPath(options.static_dir_path);
-    try base_dir.makePath(options.out_dir_path);
+    try base_dir.createDirPath(io, options.out_dir_path);
 
-    try validateOutDirWithinBase(allocator, base_dir, options.out_dir_path);
+    try validateOutDirWithinBase(allocator, io, base_dir, options.out_dir_path);
 
-    var out_dir = try base_dir.openDir(options.out_dir_path, .{ .iterate = true });
-    defer out_dir.close();
+    var out_dir = try base_dir.openDir(io, options.out_dir_path, .{ .iterate = true });
+    defer out_dir.close(io);
 
-    try validateInputAndOutDirs(allocator, base_dir, options.out_dir_path, options.posts_dir_path, options.static_dir_path);
+    try validateInputAndOutDirs(allocator, io, base_dir, options.out_dir_path, options.posts_dir_path, options.static_dir_path);
 
-    try cleanDist(out_dir);
+    try cleanDist(io, out_dir);
 
-    try copyStaticAssets(allocator, base_dir, out_dir, options.static_dir_path);
+    try copyStaticAssets(allocator, io, base_dir, out_dir, options.static_dir_path);
 
-    var posts_dir = base_dir.openDir(options.posts_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    var posts_dir = base_dir.openDir(io, options.posts_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
-    defer if (posts_dir) |*d| d.close();
+    defer if (posts_dir) |*d| d.close(io);
 
-    var posts: std.ArrayListUnmanaged(PostSummary) = .{};
+    var posts: std.ArrayListUnmanaged(PostSummary) = .empty;
     defer {
         for (posts.items) |*post| post.deinit(allocator);
         posts.deinit(allocator);
@@ -65,7 +65,7 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         }
 
         var it = pd.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
             try post_names.append(allocator, try allocator.dupe(u8, entry.name));
@@ -84,7 +84,7 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
         for (post_names.items) |md_name| {
             const stem = md_name[0 .. md_name.len - 3];
 
-            const md = pd.readFileAlloc(allocator, md_name, 10 * 1024 * 1024) catch |err| {
+            const md = pd.readFileAlloc(io, md_name, allocator, .limited(10 * 1024 * 1024)) catch |err| {
                 if (options.log_warnings) std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
                 return err;
             };
@@ -113,7 +113,7 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
             const html_name = try std.fmt.allocPrint(allocator, "{s}.html", .{slug_owned.?});
             defer allocator.free(html_name);
 
-            generatePostPage(allocator, out_dir, html_name, parsed.front_matter.title, parsed.front_matter.date_raw, parsed.body) catch |err| {
+            generatePostPage(allocator, io, out_dir, html_name, parsed.front_matter.title, parsed.front_matter.date_raw, parsed.body) catch |err| {
                 if (options.log_warnings) std.log.warn("posts/{s}: {s}", .{ md_name, @errorName(err) });
                 return err;
             };
@@ -158,86 +158,90 @@ pub fn generate(allocator: std.mem.Allocator, base_dir: std.fs.Dir, options: Gen
     };
     std.mem.sortUnstable(PostSummary, posts.items, PostsSortContext{}, PostsSortContext.lessThan);
 
-    try generateFeedXml(out_dir, options, posts.items);
+    try generateFeedXml(io, out_dir, options, posts.items);
 
     var index_buf: [16 * 1024]u8 = undefined;
-    var index_file = try out_dir.atomicFile("index.html", .{
-        .write_buffer = &index_buf,
-    });
-    defer index_file.deinit();
+    var index_file = try out_dir.createFileAtomic(io, "index.html", .{ .replace = true });
+    defer index_file.deinit(io);
+    var index_file_writer = index_file.file.writer(io, &index_buf);
+    const index_writer = &index_file_writer.interface;
 
-    try writeDocumentStart(&index_file.file_writer.interface, options.site_title);
-    try index_file.file_writer.interface.writeAll("<main>\n<h1>Posts</h1>\n<ul>\n");
+    try writeDocumentStart(index_writer, options.site_title);
+    try index_writer.writeAll("<main>\n<h1>Posts</h1>\n<ul>\n");
     for (posts.items) |post| {
-        try index_file.file_writer.interface.writeAll("<li><a href=\"");
-        try writeEscapedHtml(&index_file.file_writer.interface, post.slug);
-        try index_file.file_writer.interface.writeAll(".html\">");
-        try writeEscapedHtml(&index_file.file_writer.interface, post.title);
-        try index_file.file_writer.interface.writeAll("</a> <small><time datetime=\"");
-        try writeEscapedHtml(&index_file.file_writer.interface, post.date_raw);
-        try index_file.file_writer.interface.writeAll("\">");
-        try writeEscapedHtml(&index_file.file_writer.interface, post.date_raw);
-        try index_file.file_writer.interface.writeAll("</time></small></li>\n");
+        try index_writer.writeAll("<li><a href=\"");
+        try writeEscapedHtml(index_writer, post.slug);
+        try index_writer.writeAll(".html\">");
+        try writeEscapedHtml(index_writer, post.title);
+        try index_writer.writeAll("</a> <small><time datetime=\"");
+        try writeEscapedHtml(index_writer, post.date_raw);
+        try index_writer.writeAll("\">");
+        try writeEscapedHtml(index_writer, post.date_raw);
+        try index_writer.writeAll("</time></small></li>\n");
     }
-    try index_file.file_writer.interface.writeAll("</ul>\n</main>\n");
-    try writeDocumentEnd(&index_file.file_writer.interface);
-    try index_file.finish();
+    try index_writer.writeAll("</ul>\n</main>\n");
+    try writeDocumentEnd(index_writer);
+    try index_file_writer.flush();
+    try index_file.replace(io);
 }
 
-fn generateFeedXml(out_dir: std.fs.Dir, options: GenerateOptions, posts: []const PostSummary) !void {
+fn generateFeedXml(io: std.Io, out_dir: std.Io.Dir, options: GenerateOptions, posts: []const PostSummary) !void {
     var buf: [16 * 1024]u8 = undefined;
-    var feed_file = try out_dir.atomicFile("feed.xml", .{ .write_buffer = &buf });
-    defer feed_file.deinit();
+    var feed_file = try out_dir.createFileAtomic(io, "feed.xml", .{ .replace = true });
+    defer feed_file.deinit(io);
+    var feed_file_writer = feed_file.file.writer(io, &buf);
+    const feed_writer = &feed_file_writer.interface;
 
-    try feed_file.file_writer.interface.writeAll("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
-    try feed_file.file_writer.interface.writeAll("<rss version=\"2.0\">\n<channel>\n");
+    try feed_writer.writeAll("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    try feed_writer.writeAll("<rss version=\"2.0\">\n<channel>\n");
 
-    try feed_file.file_writer.interface.writeAll("<title>");
-    try writeEscapedXml(&feed_file.file_writer.interface, options.site_title);
-    try feed_file.file_writer.interface.writeAll("</title>\n");
+    try feed_writer.writeAll("<title>");
+    try writeEscapedXml(feed_writer, options.site_title);
+    try feed_writer.writeAll("</title>\n");
 
-    try feed_file.file_writer.interface.writeAll("<link>");
-    try writeEscapedXml(&feed_file.file_writer.interface, std.mem.trimRight(u8, options.base_url, "/"));
-    try feed_file.file_writer.interface.writeAll("</link>\n");
+    try feed_writer.writeAll("<link>");
+    try writeEscapedXml(feed_writer, std.mem.trimEnd(u8, options.base_url, "/"));
+    try feed_writer.writeAll("</link>\n");
 
-    try feed_file.file_writer.interface.writeAll("<description>");
-    try writeEscapedXml(&feed_file.file_writer.interface, options.site_description);
-    try feed_file.file_writer.interface.writeAll("</description>\n");
+    try feed_writer.writeAll("<description>");
+    try writeEscapedXml(feed_writer, options.site_description);
+    try feed_writer.writeAll("</description>\n");
 
     if (posts.len != 0) {
-        try feed_file.file_writer.interface.writeAll("<lastBuildDate>");
-        try writeRfc822Date(&feed_file.file_writer.interface, posts[0].date);
-        try feed_file.file_writer.interface.writeAll("</lastBuildDate>\n");
+        try feed_writer.writeAll("<lastBuildDate>");
+        try writeRfc822Date(feed_writer, posts[0].date);
+        try feed_writer.writeAll("</lastBuildDate>\n");
     }
 
-    try feed_file.file_writer.interface.writeAll("<generator>blog</generator>\n");
+    try feed_writer.writeAll("<generator>blog</generator>\n");
 
     for (posts) |post| {
-        try feed_file.file_writer.interface.writeAll("<item>\n<title>");
-        try writeEscapedXml(&feed_file.file_writer.interface, post.title);
-        try feed_file.file_writer.interface.writeAll("</title>\n<link>");
-        try writePostUrl(&feed_file.file_writer.interface, options.base_url, post.slug);
-        try feed_file.file_writer.interface.writeAll("</link>\n<guid isPermaLink=\"true\">");
-        try writePostUrl(&feed_file.file_writer.interface, options.base_url, post.slug);
-        try feed_file.file_writer.interface.writeAll("</guid>\n<pubDate>");
-        try writeRfc822Date(&feed_file.file_writer.interface, post.date);
-        try feed_file.file_writer.interface.writeAll("</pubDate>\n");
+        try feed_writer.writeAll("<item>\n<title>");
+        try writeEscapedXml(feed_writer, post.title);
+        try feed_writer.writeAll("</title>\n<link>");
+        try writePostUrl(feed_writer, options.base_url, post.slug);
+        try feed_writer.writeAll("</link>\n<guid isPermaLink=\"true\">");
+        try writePostUrl(feed_writer, options.base_url, post.slug);
+        try feed_writer.writeAll("</guid>\n<pubDate>");
+        try writeRfc822Date(feed_writer, post.date);
+        try feed_writer.writeAll("</pubDate>\n");
 
         if (post.description) |desc| {
-            try feed_file.file_writer.interface.writeAll("<description>");
-            try writeEscapedXml(&feed_file.file_writer.interface, desc);
-            try feed_file.file_writer.interface.writeAll("</description>\n");
+            try feed_writer.writeAll("<description>");
+            try writeEscapedXml(feed_writer, desc);
+            try feed_writer.writeAll("</description>\n");
         }
 
-        try feed_file.file_writer.interface.writeAll("</item>\n");
+        try feed_writer.writeAll("</item>\n");
     }
 
-    try feed_file.file_writer.interface.writeAll("</channel>\n</rss>\n");
-    try feed_file.finish();
+    try feed_writer.writeAll("</channel>\n</rss>\n");
+    try feed_file_writer.flush();
+    try feed_file.replace(io);
 }
 
 fn writePostUrl(w: *std.Io.Writer, base_url: []const u8, slug: []const u8) !void {
-    const base = std.mem.trimRight(u8, base_url, "/");
+    const base = std.mem.trimEnd(u8, base_url, "/");
     try writeEscapedXml(w, base);
     try w.writeAll("/");
     try writeEscapedXml(w, slug);
@@ -330,11 +334,11 @@ fn validateStaticDirPath(static_dir_path: []const u8) !void {
     }
 }
 
-fn validateOutDirWithinBase(allocator: std.mem.Allocator, base_dir: std.fs.Dir, out_dir_path: []const u8) !void {
-    const base_abs = try base_dir.realpathAlloc(allocator, ".");
+fn validateOutDirWithinBase(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir, out_dir_path: []const u8) !void {
+    const base_abs = try base_dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(base_abs);
 
-    const out_abs = try base_dir.realpathAlloc(allocator, out_dir_path);
+    const out_abs = try base_dir.realPathFileAlloc(io, out_dir_path, allocator);
     defer allocator.free(out_abs);
 
     if (std.mem.eql(u8, base_abs, out_abs)) return error.OutDirIsBaseDir;
@@ -384,32 +388,33 @@ fn isValidXmlChar(cp: u21) bool {
         (cp >= 0x10000 and cp <= 0x10FFFF);
 }
 
-fn cleanDist(out_dir: std.fs.Dir) !void {
+fn cleanDist(io: std.Io, out_dir: std.Io.Dir) !void {
     var it = out_dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
         switch (entry.kind) {
-            .directory => try out_dir.deleteTree(entry.name),
-            else => try out_dir.deleteFile(entry.name),
+            .directory => try out_dir.deleteTree(io, entry.name),
+            else => try out_dir.deleteFile(io, entry.name),
         }
     }
 }
 
 fn validateInputAndOutDirs(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    base_dir: std.Io.Dir,
     out_dir_path: []const u8,
     posts_dir_path: []const u8,
     static_dir_path: []const u8,
 ) !void {
-    const base_abs = try base_dir.realpathAlloc(allocator, ".");
+    const base_abs = try base_dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(base_abs);
 
-    const out_abs = try base_dir.realpathAlloc(allocator, out_dir_path);
+    const out_abs = try base_dir.realPathFileAlloc(io, out_dir_path, allocator);
     defer allocator.free(out_abs);
 
-    try validateExistingInputDirWithinBase(allocator, base_dir, base_abs, out_abs, posts_dir_path, .posts);
-    try validateExistingInputDirWithinBase(allocator, base_dir, base_abs, out_abs, static_dir_path, .static);
+    try validateExistingInputDirWithinBase(allocator, io, base_dir, base_abs, out_abs, posts_dir_path, .posts);
+    try validateExistingInputDirWithinBase(allocator, io, base_dir, base_abs, out_abs, static_dir_path, .static);
 }
 
 const InputDirKind = enum {
@@ -419,13 +424,14 @@ const InputDirKind = enum {
 
 fn validateExistingInputDirWithinBase(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    base_dir: std.Io.Dir,
     base_abs: []const u8,
     out_abs: []const u8,
     dir_path: []const u8,
     kind: InputDirKind,
 ) !void {
-    const dir_abs = base_dir.realpathAlloc(allocator, dir_path) catch |err| switch (err) {
+    const dir_abs = base_dir.realPathFileAlloc(io, dir_path, allocator) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -471,18 +477,18 @@ fn trimTrailingSeps(path: []const u8) []const u8 {
     return path[0..end];
 }
 
-fn copyStaticAssets(allocator: std.mem.Allocator, base_dir: std.fs.Dir, out_dir: std.fs.Dir, static_dir_path: []const u8) !void {
-    var static_dir = base_dir.openDir(static_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+fn copyStaticAssets(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir, out_dir: std.Io.Dir, static_dir_path: []const u8) !void {
+    var static_dir = base_dir.openDir(io, static_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer static_dir.close();
+    defer static_dir.close(io);
 
-    try copyDirRecursive(allocator, static_dir, out_dir);
+    try copyDirRecursive(allocator, io, static_dir, out_dir);
 }
 
-fn copyDirRecursive(allocator: std.mem.Allocator, src_root: std.fs.Dir, dst_root: std.fs.Dir) !void {
-    var stack: std.ArrayListUnmanaged([]u8) = .{};
+fn copyDirRecursive(allocator: std.mem.Allocator, io: std.Io, src_root: std.Io.Dir, dst_root: std.Io.Dir) !void {
+    var stack: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (stack.items) |p| allocator.free(p);
         stack.deinit(allocator);
@@ -497,26 +503,26 @@ fn copyDirRecursive(allocator: std.mem.Allocator, src_root: std.fs.Dir, dst_root
     while (stack.pop()) |rel_path| {
         defer allocator.free(rel_path);
 
-        var src_dir: std.fs.Dir = src_root;
-        var dst_dir: std.fs.Dir = dst_root;
+        var src_dir: std.Io.Dir = src_root;
+        var dst_dir: std.Io.Dir = dst_root;
         var close_dirs = false;
         if (rel_path.len != 0) {
-            src_dir = try src_root.openDir(rel_path, .{ .iterate = true });
-            dst_dir = try dst_root.openDir(rel_path, .{ .iterate = true });
+            src_dir = try src_root.openDir(io, rel_path, .{ .iterate = true });
+            dst_dir = try dst_root.openDir(io, rel_path, .{ .iterate = true });
             close_dirs = true;
         }
         defer if (close_dirs) {
-            src_dir.close();
-            dst_dir.close();
+            src_dir.close(io);
+            dst_dir.close(io);
         };
 
         var it = src_dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(io)) |entry| {
             if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
             switch (entry.kind) {
-                .file => try copyFileAtomic(src_dir, entry.name, dst_dir, entry.name),
+                .file => try copyFileAtomic(io, src_dir, entry.name, dst_dir, entry.name),
                 .directory => {
-                    try dst_dir.makePath(entry.name);
+                    try dst_dir.createDirPath(io, entry.name);
 
                     const child_rel_path = child_rel_path: {
                         if (rel_path.len == 0) break :child_rel_path try allocator.dupe(u8, entry.name);
@@ -533,52 +539,62 @@ fn copyDirRecursive(allocator: std.mem.Allocator, src_root: std.fs.Dir, dst_root
     }
 }
 
-fn copyFileAtomic(src_dir: std.fs.Dir, src_name: []const u8, dst_dir: std.fs.Dir, dst_name: []const u8) !void {
-    var src_file = try src_dir.openFile(src_name, .{});
-    defer src_file.close();
+fn copyFileAtomic(io: std.Io, src_dir: std.Io.Dir, src_name: []const u8, dst_dir: std.Io.Dir, dst_name: []const u8) !void {
+    var src_file = try src_dir.openFile(io, src_name, .{});
+    defer src_file.close(io);
 
     var write_buf: [16 * 1024]u8 = undefined;
-    var out_file = try dst_dir.atomicFile(dst_name, .{ .write_buffer = &write_buf });
-    defer out_file.deinit();
+    var out_file = try dst_dir.createFileAtomic(io, dst_name, .{ .replace = true });
+    defer out_file.deinit(io);
+    var file_writer = out_file.file.writer(io, &write_buf);
 
     var read_buf: [8192]u8 = undefined;
+    var reader_buf: [8192]u8 = undefined;
+    var reader = src_file.reader(io, &reader_buf);
     while (true) {
-        const n = try src_file.readAll(&read_buf);
+        const n = reader.interface.readSliceShort(&read_buf) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+        };
         if (n == 0) break;
-        try out_file.file_writer.interface.writeAll(read_buf[0..n]);
+        try file_writer.interface.writeAll(read_buf[0..n]);
         if (n < read_buf.len) break;
     }
 
-    try out_file.finish();
+    try file_writer.flush();
+    try out_file.replace(io);
 }
 
 fn generatePostPage(
     allocator: std.mem.Allocator,
-    out_dir: std.fs.Dir,
+    io: std.Io,
+    out_dir: std.Io.Dir,
     out_name: []const u8,
     title: []const u8,
     date_raw: []const u8,
     markdown: []const u8,
 ) !void {
     var buf: [16 * 1024]u8 = undefined;
-    var out_file = try out_dir.atomicFile(out_name, .{ .write_buffer = &buf });
-    defer out_file.deinit();
+    var out_file = try out_dir.createFileAtomic(io, out_name, .{ .replace = true });
+    defer out_file.deinit(io);
+    var file_writer = out_file.file.writer(io, &buf);
+    const writer = &file_writer.interface;
 
-    try writeDocumentStart(&out_file.file_writer.interface, title);
-    try out_file.file_writer.interface.writeAll("<main>\n<p><a href=\"index.html\">Back</a></p>\n<h1>");
-    try writeEscapedHtml(&out_file.file_writer.interface, title);
-    try out_file.file_writer.interface.writeAll("</h1>\n<p><small><time datetime=\"");
-    try writeEscapedHtml(&out_file.file_writer.interface, date_raw);
-    try out_file.file_writer.interface.writeAll("\">");
-    try writeEscapedHtml(&out_file.file_writer.interface, date_raw);
-    try out_file.file_writer.interface.writeAll("</time></small></p>\n<article>\n");
+    try writeDocumentStart(writer, title);
+    try writer.writeAll("<main>\n<p><a href=\"index.html\">Back</a></p>\n<h1>");
+    try writeEscapedHtml(writer, title);
+    try writer.writeAll("</h1>\n<p><small><time datetime=\"");
+    try writeEscapedHtml(writer, date_raw);
+    try writer.writeAll("\">");
+    try writeEscapedHtml(writer, date_raw);
+    try writer.writeAll("</time></small></p>\n<article>\n");
 
     const html = try markdown_renderer.renderHtmlAlloc(allocator, markdown);
     defer allocator.free(html);
-    try out_file.file_writer.interface.writeAll(html);
-    try out_file.file_writer.interface.writeAll("\n</article>\n</main>\n");
-    try writeDocumentEnd(&out_file.file_writer.interface);
-    try out_file.finish();
+    try writer.writeAll(html);
+    try writer.writeAll("\n</article>\n</main>\n");
+    try writeDocumentEnd(writer);
+    try file_writer.flush();
+    try out_file.replace(io);
 }
 
 fn writeDocumentStart(w: *std.Io.Writer, title: []const u8) !void {
@@ -661,17 +677,17 @@ test "cleanDist preserves .gitignore" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("dist");
-    var dist = try tmp.dir.openDir("dist", .{ .iterate = true });
-    defer dist.close();
+    try tmp.dir.createDirPath(std.testing.io, "dist");
+    var dist = try tmp.dir.openDir(std.testing.io, "dist", .{ .iterate = true });
+    defer dist.close(std.testing.io);
 
-    try dist.writeFile(.{ .sub_path = ".gitignore", .data = "*\n" });
-    try dist.writeFile(.{ .sub_path = "old.html", .data = "old\n" });
+    try dist.writeFile(std.testing.io, .{ .sub_path = ".gitignore", .data = "*\n" });
+    try dist.writeFile(std.testing.io, .{ .sub_path = "old.html", .data = "old\n" });
 
-    try cleanDist(dist);
+    try cleanDist(std.testing.io, dist);
 
-    try dist.access(".gitignore", .{});
-    try testing.expectError(error.FileNotFound, dist.access("old.html", .{}));
+    try dist.access(std.testing.io, ".gitignore", .{});
+    try testing.expectError(error.FileNotFound, dist.access(std.testing.io, "old.html", .{}));
 }
 
 test "cleanDist does not follow symlinks" {
@@ -680,20 +696,20 @@ test "cleanDist does not follow symlinks" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("dist");
-    try tmp.dir.makePath("victim");
-    try tmp.dir.writeFile(.{ .sub_path = "victim/keep.txt", .data = "keep\n" });
+    try tmp.dir.createDirPath(std.testing.io, "dist");
+    try tmp.dir.createDirPath(std.testing.io, "victim");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "victim/keep.txt", .data = "keep\n" });
 
-    var dist = try tmp.dir.openDir("dist", .{ .iterate = true });
-    defer dist.close();
+    var dist = try tmp.dir.openDir(std.testing.io, "dist", .{ .iterate = true });
+    defer dist.close(std.testing.io);
 
-    try dist.writeFile(.{ .sub_path = ".gitignore", .data = "*\n" });
-    try dist.symLink("../victim", "victim_link", .{ .is_directory = true });
+    try dist.writeFile(std.testing.io, .{ .sub_path = ".gitignore", .data = "*\n" });
+    try dist.symLink(std.testing.io, "../victim", "victim_link", .{ .is_directory = true });
 
-    try cleanDist(dist);
+    try cleanDist(std.testing.io, dist);
 
-    try tmp.dir.access("victim/keep.txt", .{});
-    try testing.expectError(error.FileNotFound, dist.access("victim_link", .{}));
+    try tmp.dir.access(std.testing.io, "victim/keep.txt", .{});
+    try testing.expectError(error.FileNotFound, dist.access(std.testing.io, "victim_link", .{}));
 }
 
 test "writeEscapedHtml escapes special characters" {
@@ -721,15 +737,15 @@ test "generate sorts posts" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("posts");
-    try tmp.dir.writeFile(.{ .sub_path = "posts/b.md", .data = 
+    try tmp.dir.createDirPath(std.testing.io, "posts");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/b.md", .data =
         \\---
         \\title: B
         \\date: 2025-12-02
         \\---
         \\b
     });
-    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = 
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/a.md", .data =
         \\---
         \\title: A
         \\date: 2025-12-01
@@ -737,9 +753,9 @@ test "generate sorts posts" {
         \\a
     });
 
-    try generate(testing.allocator, tmp.dir, .{});
+    try generate(testing.allocator, std.testing.io, tmp.dir, .{});
 
-    const index = try tmp.dir.readFileAlloc(testing.allocator, "dist/index.html", 1024 * 1024);
+    const index = try tmp.dir.readFileAlloc(std.testing.io, "dist/index.html", testing.allocator, .limited(1024 * 1024));
     defer testing.allocator.free(index);
 
     const a_pos = std.mem.indexOf(u8, index, "href=\"a.html\"") orelse return error.TestExpectedEqual;
@@ -753,8 +769,8 @@ test "generate writes feed.xml with correct base_url, dates, and descriptions" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("posts");
-    try tmp.dir.writeFile(.{ .sub_path = "posts/one.md", .data = 
+    try tmp.dir.createDirPath(std.testing.io, "posts");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/one.md", .data =
         \\---
         \\title: One & <Two>
         \\date: 2025-12-13
@@ -763,13 +779,13 @@ test "generate writes feed.xml with correct base_url, dates, and descriptions" {
         \\one
     });
 
-    try generate(testing.allocator, tmp.dir, .{
+    try generate(testing.allocator, std.testing.io, tmp.dir, .{
         .base_url = "https://example.com/blog",
         .site_title = "Example",
         .site_description = "Example desc",
     });
 
-    const feed = try tmp.dir.readFileAlloc(testing.allocator, "dist/feed.xml", 1024 * 1024);
+    const feed = try tmp.dir.readFileAlloc(std.testing.io, "dist/feed.xml", testing.allocator, .limited(1024 * 1024));
     defer testing.allocator.free(feed);
 
     try testing.expect(std.mem.indexOf(u8, feed, "<rss version=\"2.0\">") != null);
@@ -786,10 +802,10 @@ test "generate rejects unsafe out_dir_path" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try testing.expectError(error.InvalidOutDirPath, generate(testing.allocator, tmp.dir, .{ .out_dir_path = "" }));
-    try testing.expectError(error.InvalidOutDirPath, generate(testing.allocator, tmp.dir, .{ .out_dir_path = "." }));
-    try testing.expectError(error.OutDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .out_dir_path = ".." }));
-    try testing.expectError(error.OutDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .out_dir_path = "dist/../oops" }));
+    try testing.expectError(error.InvalidOutDirPath, generate(testing.allocator, std.testing.io, tmp.dir, .{ .out_dir_path = "" }));
+    try testing.expectError(error.InvalidOutDirPath, generate(testing.allocator, std.testing.io, tmp.dir, .{ .out_dir_path = "." }));
+    try testing.expectError(error.OutDirPathContainsDotDot, generate(testing.allocator, std.testing.io, tmp.dir, .{ .out_dir_path = ".." }));
+    try testing.expectError(error.OutDirPathContainsDotDot, generate(testing.allocator, std.testing.io, tmp.dir, .{ .out_dir_path = "dist/../oops" }));
 }
 
 test "generate rejects overlapping static and output directories" {
@@ -798,13 +814,13 @@ test "generate rejects overlapping static and output directories" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try testing.expectError(error.StaticDirOverlapsOutDir, generate(testing.allocator, tmp.dir, .{
+    try testing.expectError(error.StaticDirOverlapsOutDir, generate(testing.allocator, std.testing.io, tmp.dir, .{
         .out_dir_path = "dist",
         .static_dir_path = "dist",
         .log_warnings = false,
     }));
 
-    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, tmp.dir, .{
+    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, std.testing.io, tmp.dir, .{
         .out_dir_path = "dist",
         .static_dir_path = ".",
         .log_warnings = false,
@@ -817,10 +833,10 @@ test "generate rejects unsafe posts_dir_path" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try testing.expectError(error.InvalidPostsDirPath, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = "" }));
-    try testing.expectError(error.InvalidPostsDirPath, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = "." }));
-    try testing.expectError(error.PostsDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = ".." }));
-    try testing.expectError(error.PostsDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .posts_dir_path = "posts/../oops" }));
+    try testing.expectError(error.InvalidPostsDirPath, generate(testing.allocator, std.testing.io, tmp.dir, .{ .posts_dir_path = "" }));
+    try testing.expectError(error.InvalidPostsDirPath, generate(testing.allocator, std.testing.io, tmp.dir, .{ .posts_dir_path = "." }));
+    try testing.expectError(error.PostsDirPathContainsDotDot, generate(testing.allocator, std.testing.io, tmp.dir, .{ .posts_dir_path = ".." }));
+    try testing.expectError(error.PostsDirPathContainsDotDot, generate(testing.allocator, std.testing.io, tmp.dir, .{ .posts_dir_path = "posts/../oops" }));
 }
 
 test "generate rejects unsafe static_dir_path" {
@@ -829,10 +845,10 @@ test "generate rejects unsafe static_dir_path" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, tmp.dir, .{ .static_dir_path = "" }));
-    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, tmp.dir, .{ .static_dir_path = "." }));
-    try testing.expectError(error.StaticDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .static_dir_path = ".." }));
-    try testing.expectError(error.StaticDirPathContainsDotDot, generate(testing.allocator, tmp.dir, .{ .static_dir_path = "static/../oops" }));
+    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, std.testing.io, tmp.dir, .{ .static_dir_path = "" }));
+    try testing.expectError(error.InvalidStaticDirPath, generate(testing.allocator, std.testing.io, tmp.dir, .{ .static_dir_path = "." }));
+    try testing.expectError(error.StaticDirPathContainsDotDot, generate(testing.allocator, std.testing.io, tmp.dir, .{ .static_dir_path = ".." }));
+    try testing.expectError(error.StaticDirPathContainsDotDot, generate(testing.allocator, std.testing.io, tmp.dir, .{ .static_dir_path = "static/../oops" }));
 }
 
 test "generate rejects overlapping posts and output directories" {
@@ -841,7 +857,7 @@ test "generate rejects overlapping posts and output directories" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try testing.expectError(error.PostsDirOverlapsOutDir, generate(testing.allocator, tmp.dir, .{
+    try testing.expectError(error.PostsDirOverlapsOutDir, generate(testing.allocator, std.testing.io, tmp.dir, .{
         .out_dir_path = "dist",
         .posts_dir_path = "dist",
         .log_warnings = false,
@@ -854,27 +870,27 @@ test "generate rejects input directories that resolve outside base dir" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base_abs = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(base_abs);
 
     const parent_abs = std.fs.path.dirname(base_abs) orelse return error.TestExpectedEqual;
-    var parent_dir = try std.fs.openDirAbsolute(parent_abs, .{});
-    defer parent_dir.close();
+    var parent_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, parent_abs, .{});
+    defer parent_dir.close(std.testing.io);
 
-    try parent_dir.makePath("outside-static");
-    defer parent_dir.deleteTree("outside-static") catch {};
-    try tmp.dir.symLink("../outside-static", "static", .{ .is_directory = true });
+    try parent_dir.createDirPath(std.testing.io, "outside-static");
+    defer parent_dir.deleteTree(std.testing.io, "outside-static") catch {};
+    try tmp.dir.symLink(std.testing.io, "../outside-static", "static", .{ .is_directory = true });
 
-    try parent_dir.makePath("outside-posts");
-    defer parent_dir.deleteTree("outside-posts") catch {};
-    try tmp.dir.symLink("../outside-posts", "posts", .{ .is_directory = true });
+    try parent_dir.createDirPath(std.testing.io, "outside-posts");
+    defer parent_dir.deleteTree(std.testing.io, "outside-posts") catch {};
+    try tmp.dir.symLink(std.testing.io, "../outside-posts", "posts", .{ .is_directory = true });
 
-    try testing.expectError(error.StaticDirEscapesBaseDir, generate(testing.allocator, tmp.dir, .{
+    try testing.expectError(error.StaticDirEscapesBaseDir, generate(testing.allocator, std.testing.io, tmp.dir, .{
         .static_dir_path = "static",
         .posts_dir_path = "posts_ok",
         .log_warnings = false,
     }));
-    try testing.expectError(error.PostsDirEscapesBaseDir, generate(testing.allocator, tmp.dir, .{
+    try testing.expectError(error.PostsDirEscapesBaseDir, generate(testing.allocator, std.testing.io, tmp.dir, .{
         .posts_dir_path = "posts",
         .static_dir_path = "static_ok",
         .log_warnings = false,
@@ -887,15 +903,15 @@ test "generate skips drafts" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("posts");
-    try tmp.dir.writeFile(.{ .sub_path = "posts/public.md", .data = 
+    try tmp.dir.createDirPath(std.testing.io, "posts");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/public.md", .data =
         \\---
         \\title: Public
         \\date: 2025-12-01
         \\---
         \\hi
     });
-    try tmp.dir.writeFile(.{ .sub_path = "posts/draft.md", .data = 
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/draft.md", .data =
         \\---
         \\title: Draft
         \\date: 2025-12-02
@@ -904,16 +920,16 @@ test "generate skips drafts" {
         \\secret
     });
 
-    try generate(testing.allocator, tmp.dir, .{});
+    try generate(testing.allocator, std.testing.io, tmp.dir, .{});
 
-    const index = try tmp.dir.readFileAlloc(testing.allocator, "dist/index.html", 1024 * 1024);
+    const index = try tmp.dir.readFileAlloc(std.testing.io, "dist/index.html", testing.allocator, .limited(1024 * 1024));
     defer testing.allocator.free(index);
 
     try testing.expect(std.mem.indexOf(u8, index, "Public") != null);
     try testing.expect(std.mem.indexOf(u8, index, "Draft") == null);
 
-    try tmp.dir.access("dist/public.html", .{});
-    try testing.expectError(error.FileNotFound, tmp.dir.access("dist/draft.html", .{}));
+    try tmp.dir.access(std.testing.io, "dist/public.html", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "dist/draft.html", .{}));
 }
 
 test "generate errors on duplicate slugs" {
@@ -922,8 +938,8 @@ test "generate errors on duplicate slugs" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("posts");
-    try tmp.dir.writeFile(.{ .sub_path = "posts/one.md", .data = 
+    try tmp.dir.createDirPath(std.testing.io, "posts");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/one.md", .data =
         \\---
         \\title: One
         \\date: 2025-12-01
@@ -931,7 +947,7 @@ test "generate errors on duplicate slugs" {
         \\---
         \\hi
     });
-    try tmp.dir.writeFile(.{ .sub_path = "posts/two.md", .data = 
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/two.md", .data =
         \\---
         \\title: Two
         \\date: 2025-12-02
@@ -940,7 +956,7 @@ test "generate errors on duplicate slugs" {
         \\hi
     });
 
-    try testing.expectError(error.DuplicateSlug, generate(testing.allocator, tmp.dir, .{ .log_warnings = false }));
+    try testing.expectError(error.DuplicateSlug, generate(testing.allocator, std.testing.io, tmp.dir, .{ .log_warnings = false }));
 }
 
 test "generatePostPage renders markdown to HTML" {
@@ -949,11 +965,11 @@ test "generatePostPage renders markdown to HTML" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("dist");
-    var dist = try tmp.dir.openDir("dist", .{ .iterate = true });
-    defer dist.close();
+    try tmp.dir.createDirPath(std.testing.io, "dist");
+    var dist = try tmp.dir.openDir(std.testing.io, "dist", .{ .iterate = true });
+    defer dist.close(std.testing.io);
 
-    try generatePostPage(testing.allocator, dist, "post.html", "Post", "2025-12-01",
+    try generatePostPage(testing.allocator, std.testing.io, dist, "post.html", "Post", "2025-12-01",
         \\# Hello
         \\
         \\This is **bold**.
@@ -964,7 +980,7 @@ test "generatePostPage renders markdown to HTML" {
         \\
     );
 
-    const html = try tmp.dir.readFileAlloc(testing.allocator, "dist/post.html", 1024 * 1024);
+    const html = try tmp.dir.readFileAlloc(std.testing.io, "dist/post.html", testing.allocator, .limited(1024 * 1024));
     defer testing.allocator.free(html);
 
     try testing.expect(std.mem.indexOf(u8, html, "href=\"style.css\"") != null);
@@ -980,12 +996,12 @@ test "generate copies static assets" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("static/images");
-    try tmp.dir.writeFile(.{ .sub_path = "static/style.css", .data = "body{}\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "static/images/logo.png", .data = "x" });
+    try tmp.dir.createDirPath(std.testing.io, "static/images");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "static/style.css", .data = "body{}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "static/images/logo.png", .data = "x" });
 
-    try tmp.dir.makePath("posts");
-    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = 
+    try tmp.dir.createDirPath(std.testing.io, "posts");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/a.md", .data =
         \\---
         \\title: A
         \\date: 2025-12-01
@@ -993,8 +1009,8 @@ test "generate copies static assets" {
         \\hi
     });
 
-    try generate(testing.allocator, tmp.dir, .{});
+    try generate(testing.allocator, std.testing.io, tmp.dir, .{});
 
-    try tmp.dir.access("dist/style.css", .{});
-    try tmp.dir.access("dist/images/logo.png", .{});
+    try tmp.dir.access(std.testing.io, "dist/style.css", .{});
+    try tmp.dir.access(std.testing.io, "dist/images/logo.png", .{});
 }

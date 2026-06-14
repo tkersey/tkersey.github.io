@@ -1,4 +1,5 @@
 const std = @import("std");
+const net = std.Io.net;
 
 pub const ServeOptions = struct {
     host: []const u8 = "127.0.0.1",
@@ -6,30 +7,30 @@ pub const ServeOptions = struct {
     out_dir_path: []const u8 = "dist",
 };
 
-pub fn serve(base_dir: std.fs.Dir, options: ServeOptions) !void {
-    const address = try std.net.Address.parseIp(options.host, options.port);
-    var tcp_server = try address.listen(.{ .reuse_address = true });
-    defer tcp_server.deinit();
+pub fn serve(io: std.Io, base_dir: std.Io.Dir, options: ServeOptions) !void {
+    const address = try net.IpAddress.parse(options.host, options.port);
+    var tcp_server = try address.listen(io, .{ .reuse_address = true });
+    defer tcp_server.deinit(io);
 
     while (true) {
-        const connection = try tcp_server.accept();
-        handleConnection(base_dir, options.out_dir_path, connection) catch |err| {
+        const connection = try tcp_server.accept(io);
+        handleConnection(io, base_dir, options.out_dir_path, connection) catch |err| {
             std.log.warn("serve: connection failed: {s}", .{@errorName(err)});
         };
     }
 }
 
-fn handleConnection(base_dir: std.fs.Dir, out_dir_path: []const u8, connection: std.net.Server.Connection) !void {
-    defer connection.stream.close();
+fn handleConnection(io: std.Io, base_dir: std.Io.Dir, out_dir_path: []const u8, connection: net.Stream) !void {
+    defer connection.close(io);
 
     var send_buffer: [4096]u8 = undefined;
     var recv_buffer: [4096]u8 = undefined;
-    var connection_reader = connection.stream.reader(&recv_buffer);
-    var connection_writer = connection.stream.writer(&send_buffer);
-    var http_server: std.http.Server = .init(connection_reader.interface(), &connection_writer.interface);
+    var connection_reader = connection.reader(io, &recv_buffer);
+    var connection_writer = connection.writer(io, &send_buffer);
+    var http_server: std.http.Server = .init(&connection_reader.interface, &connection_writer.interface);
 
-    var out_dir = try base_dir.openDir(out_dir_path, .{});
-    defer out_dir.close();
+    var out_dir = try base_dir.openDir(io, out_dir_path, .{});
+    defer out_dir.close(io);
 
     while (true) {
         var request = http_server.receiveHead() catch |err| switch (err) {
@@ -37,7 +38,7 @@ fn handleConnection(base_dir: std.fs.Dir, out_dir_path: []const u8, connection: 
             else => return err,
         };
 
-        serveRequest(&request, out_dir) catch |err| {
+        serveRequest(io, &request, out_dir) catch |err| {
             std.log.debug(
                 "serve: {s} {s} failed: {s}",
                 .{ @tagName(request.head.method), request.head.target, @errorName(err) },
@@ -47,7 +48,7 @@ fn handleConnection(base_dir: std.fs.Dir, out_dir_path: []const u8, connection: 
     }
 }
 
-fn serveRequest(request: *std.http.Server.Request, out_dir: std.fs.Dir) !void {
+fn serveRequest(io: std.Io, request: *std.http.Server.Request, out_dir: std.Io.Dir) !void {
     const max_file_size: u64 = 20 * 1024 * 1024;
 
     if (request.head.method != .GET and request.head.method != .HEAD) {
@@ -79,13 +80,13 @@ fn serveRequest(request: *std.http.Server.Request, out_dir: std.fs.Dir) !void {
         }
         break :file_path path;
     };
-    var file = out_dir.openFile(file_path, .{}) catch {
+    var file = out_dir.openFile(io, file_path, .{}) catch {
         try respondNotFound(request);
         return;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const file_stat = file.stat() catch {
+    const file_stat = file.stat(io) catch {
         try respondNotFound(request);
         return;
     };
@@ -116,7 +117,7 @@ fn serveRequest(request: *std.http.Server.Request, out_dir: std.fs.Dir) !void {
     if (!body.isEliding()) {
         var read_buf: [8192]u8 = undefined;
         var file_reader_buf: [8192]u8 = undefined;
-        var reader = file.reader(&file_reader_buf);
+        var reader = file.reader(io, &file_reader_buf);
 
         while (true) {
             const n = try reader.interface.readSliceShort(&read_buf);

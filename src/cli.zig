@@ -23,8 +23,8 @@ const SiteConfig = struct {
     }
 };
 
-fn loadSiteConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !SiteConfig {
-    const raw = base_dir.readFileAlloc(allocator, site_config_path, 1024 * 1024) catch |err| switch (err) {
+fn loadSiteConfig(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir) !SiteConfig {
+    const raw = base_dir.readFileAlloc(io, site_config_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -34,13 +34,13 @@ fn loadSiteConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !SiteConfi
 
     var it = std.mem.splitScalar(u8, raw, '\n');
     while (it.next()) |raw_line| {
-        const trimmed = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        const trimmed = std.mem.trim(u8, std.mem.trimEnd(u8, raw_line, "\r"), " \t");
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue;
 
         const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
-        const key = std.mem.trimRight(u8, trimmed[0..colon], " \t");
-        var value = std.mem.trimLeft(u8, trimmed[colon + 1 ..], " \t");
+        const key = std.mem.trimEnd(u8, trimmed[0..colon], " \t");
+        var value = std.mem.trimStart(u8, trimmed[colon + 1 ..], " \t");
         value = scalars.stripInlineComment(value);
         const scalar = scalars.parseScalar(value);
         if (scalar.len == 0) continue;
@@ -56,11 +56,11 @@ fn loadSiteConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !SiteConfi
     return config;
 }
 
-fn generateFromConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir, log_warnings: bool) !void {
-    var config = try loadSiteConfig(allocator, base_dir);
+fn generateFromConfig(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir, log_warnings: bool) !void {
+    var config = try loadSiteConfig(allocator, io, base_dir);
     defer config.deinit(allocator);
 
-    try site.generate(allocator, base_dir, .{
+    try site.generate(allocator, io, base_dir, .{
         .out_dir_path = config.dist_dir,
         .posts_dir_path = config.posts_dir,
         .static_dir_path = config.static_dir,
@@ -79,15 +79,17 @@ fn watchTargetsFromConfig(config: SiteConfig) watch.WatchTargets {
     };
 }
 
-fn fingerprintFromConfig(allocator: std.mem.Allocator, base_dir: std.fs.Dir) !u64 {
-    var config = try loadSiteConfig(allocator, base_dir);
+fn fingerprintFromConfig(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir) !u64 {
+    var config = try loadSiteConfig(allocator, io, base_dir);
     defer config.deinit(allocator);
-    return watch.fingerprint(allocator, base_dir, watchTargetsFromConfig(config));
+    return watch.fingerprint(allocator, io, base_dir, watchTargetsFromConfig(config));
 }
 
 pub fn run(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    base_dir: std.Io.Dir,
     args: []const []const u8,
     stdout: anytype,
     stderr: anytype,
@@ -104,9 +106,9 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, cmd, "build")) {
-        var config = try loadSiteConfig(allocator, base_dir);
+        var config = try loadSiteConfig(allocator, io, base_dir);
         defer config.deinit(allocator);
-        try site.generate(allocator, base_dir, .{
+        try site.generate(allocator, io, base_dir, .{
             .out_dir_path = config.dist_dir,
             .posts_dir_path = config.posts_dir,
             .static_dir_path = config.static_dir,
@@ -172,10 +174,10 @@ pub fn run(
             }
         }
 
-        var config = try loadSiteConfig(allocator, base_dir);
+        var config = try loadSiteConfig(allocator, io, base_dir);
         defer config.deinit(allocator);
 
-        try site.generate(allocator, base_dir, .{
+        try site.generate(allocator, io, base_dir, .{
             .out_dir_path = config.dist_dir,
             .posts_dir_path = config.posts_dir,
             .static_dir_path = config.static_dir,
@@ -199,12 +201,13 @@ pub fn run(
             };
 
             var watcher_started = false;
-            if (base_dir.openDir(".", .{ .iterate = true })) |dir| {
+            if (base_dir.openDir(io, ".", .{ .iterate = true })) |dir| {
                 var watch_dir = dir;
-                defer watch_dir.close();
+                defer watch_dir.close(io);
 
-                if (fingerprintFromConfig(allocator, watch_dir)) |_| {
+                if (fingerprintFromConfig(allocator, io, watch_dir)) |_| {
                     const thread_args: WatchThreadArgs = .{
+                        .io = io,
                         .base_dir = base_dir,
                         .poll_interval_ns = poll_ns,
                     };
@@ -223,12 +226,12 @@ pub fn run(
 
             if (watcher_started) try stdout.print("Watching for changes (polling every {d}ms)\n", .{poll_ms});
         }
-        try server.serve(base_dir, .{ .host = host, .port = port, .out_dir_path = config.dist_dir });
+        try server.serve(io, base_dir, .{ .host = host, .port = port, .out_dir_path = config.dist_dir });
         return 0;
     }
 
     if (std.mem.eql(u8, cmd, "linkedin")) {
-        return runLinkedIn(allocator, base_dir, args[2..], stdout, stderr);
+        return runLinkedIn(allocator, io, environ_map, base_dir, args[2..], stdout, stderr);
     }
 
     try stderr.print("error: unknown command '{s}'\n\n", .{cmd});
@@ -254,29 +257,33 @@ fn printUsage(writer: anytype) !void {
 }
 
 const WatchThreadArgs = struct {
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    base_dir: std.Io.Dir,
     poll_interval_ns: u64,
 };
 
 fn watchThreadMain(args: WatchThreadArgs) void {
     const allocator = std.heap.c_allocator;
 
-    var base_dir = args.base_dir.openDir(".", .{ .iterate = true }) catch |err| {
+    var base_dir = args.base_dir.openDir(args.io, ".", .{ .iterate = true }) catch |err| {
         std.log.err("watch: open base dir failed: {s}", .{@errorName(err)});
         return;
     };
-    defer base_dir.close();
+    defer base_dir.close(args.io);
 
-    var stable = fingerprintFromConfig(allocator, base_dir) catch |err| {
+    var stable = fingerprintFromConfig(allocator, args.io, base_dir) catch |err| {
         std.log.err("watch: initial fingerprint failed: {s}", .{@errorName(err)});
         return;
     };
 
     var pending: ?u64 = null;
     while (true) {
-        std.Thread.sleep(args.poll_interval_ns);
+        args.io.sleep(.fromNanoseconds(@intCast(args.poll_interval_ns)), .awake) catch |err| {
+            std.log.err("watch: sleep failed: {s}", .{@errorName(err)});
+            return;
+        };
 
-        const current = fingerprintFromConfig(allocator, base_dir) catch |err| {
+        const current = fingerprintFromConfig(allocator, args.io, base_dir) catch |err| {
             std.log.err("watch: fingerprint failed: {s}", .{@errorName(err)});
             continue;
         };
@@ -292,7 +299,7 @@ fn watchThreadMain(args: WatchThreadArgs) void {
         pending = null;
 
         std.log.info("Change detected; rebuilding...", .{});
-        generateFromConfig(allocator, base_dir, true) catch |err| {
+        generateFromConfig(allocator, args.io, base_dir, true) catch |err| {
             std.log.err("Rebuild failed: {s}", .{@errorName(err)});
             continue;
         };
@@ -308,7 +315,9 @@ const default_redirect_uri = "http://127.0.0.1:8123/linkedin/callback";
 
 fn runLinkedIn(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    base_dir: std.Io.Dir,
     args: []const []const u8,
     stdout: anytype,
     stderr: anytype,
@@ -383,18 +392,18 @@ fn runLinkedIn(
         return 2;
     }
 
-    var dot_env = try DotEnv.load(allocator, base_dir, dotenv_path);
+    var dot_env = try DotEnv.load(allocator, io, base_dir, dotenv_path);
     defer dot_env.deinit(allocator);
 
     if (auth) {
-        return runLinkedInAuth(allocator, base_dir, stdout, stderr, &dot_env);
+        return runLinkedInAuth(allocator, io, environ_map, base_dir, stdout, stderr, &dot_env);
     }
 
     if (whoami) {
-        const access_token = (try getEnvRequired(allocator, stderr, &dot_env, "LINKEDIN_ACCESS_TOKEN")) orelse return 2;
+        const access_token = (try getEnvRequired(allocator, environ_map, stderr, &dot_env, "LINKEDIN_ACCESS_TOKEN")) orelse return 2;
         defer allocator.free(access_token);
 
-        var client = std.http.Client{ .allocator = allocator };
+        var client = std.http.Client{ .allocator = allocator, .io = io };
         defer client.deinit();
 
         var result = try linkedin.fetchPersonId(allocator, &client, access_token);
@@ -423,7 +432,7 @@ fn runLinkedIn(
         return 0;
     }
 
-    var config = try loadSiteConfig(allocator, base_dir);
+    var config = try loadSiteConfig(allocator, io, base_dir);
     defer config.deinit(allocator);
 
     var posts: std.ArrayList(linkedin.Post) = .empty;
@@ -434,7 +443,7 @@ fn runLinkedIn(
 
     if (files.items.len != 0) {
         for (files.items) |path| {
-            const maybe_post = try linkedin.loadPost(allocator, base_dir, path, config.base_url);
+            const maybe_post = try linkedin.loadPost(allocator, io, base_dir, path, config.base_url);
             if (maybe_post == null) {
                 try stdout.print("Skipping draft: {s}\n", .{path});
                 continue;
@@ -442,7 +451,7 @@ fn runLinkedIn(
             try posts.append(allocator, maybe_post.?);
         }
     } else if (changed_ref) |ref| {
-        var changed = try gitChangedPostPaths(allocator, base_dir, config.posts_dir, ref);
+        var changed = try gitChangedPostPaths(allocator, io, base_dir, config.posts_dir, ref);
         defer freeStringList(&changed, allocator);
 
         if (changed.items.len == 0) {
@@ -451,7 +460,7 @@ fn runLinkedIn(
         }
 
         for (changed.items) |path| {
-            const maybe_post = try linkedin.loadPost(allocator, base_dir, path, config.base_url);
+            const maybe_post = try linkedin.loadPost(allocator, io, base_dir, path, config.base_url);
             if (maybe_post == null) {
                 try stdout.print("Skipping draft: {s}\n", .{path});
                 continue;
@@ -459,7 +468,7 @@ fn runLinkedIn(
             try posts.append(allocator, maybe_post.?);
         }
     } else {
-        const latest = try linkedin.findLatestPost(allocator, base_dir, config.posts_dir, config.base_url);
+        const latest = try linkedin.findLatestPost(allocator, io, base_dir, config.posts_dir, config.base_url);
         if (latest == null) {
             try stdout.writeAll("No posts found to share.\n");
             return 0;
@@ -481,13 +490,13 @@ fn runLinkedIn(
         return 0;
     }
 
-    const access_token = (try getEnvRequired(allocator, stderr, &dot_env, "LINKEDIN_ACCESS_TOKEN")) orelse return 2;
+    const access_token = (try getEnvRequired(allocator, environ_map, stderr, &dot_env, "LINKEDIN_ACCESS_TOKEN")) orelse return 2;
     defer allocator.free(access_token);
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
-    const author_urn = (try resolveAuthorUrn(allocator, stderr, &dot_env, &client, access_token)) orelse return 2;
+    const author_urn = (try resolveAuthorUrn(allocator, environ_map, stderr, &dot_env, &client, access_token)) orelse return 2;
     defer allocator.free(author_urn);
 
     for (posts.items) |post| {
@@ -547,10 +556,10 @@ const DotEnv = struct {
     lines: std.ArrayList(EnvLine),
     path: []const u8,
 
-    pub fn load(allocator: std.mem.Allocator, base_dir: std.fs.Dir, path: []const u8) !DotEnv {
+    pub fn load(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir, path: []const u8) !DotEnv {
         var lines: std.ArrayList(EnvLine) = .empty;
 
-        const raw = base_dir.readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+        const raw = base_dir.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return .{ .lines = lines, .path = path },
             else => return err,
         };
@@ -558,7 +567,7 @@ const DotEnv = struct {
 
         var it = std.mem.splitScalar(u8, raw, '\n');
         while (it.next()) |line| {
-            const trimmed = std.mem.trimRight(u8, line, "\r");
+            const trimmed = std.mem.trimEnd(u8, line, "\r");
             try lines.append(allocator, try parseEnvLine(allocator, trimmed));
         }
 
@@ -612,7 +621,7 @@ const DotEnv = struct {
         } });
     }
 
-    pub fn write(self: *DotEnv, allocator: std.mem.Allocator, base_dir: std.fs.Dir) !void {
+    pub fn write(self: *DotEnv, allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
 
@@ -628,27 +637,30 @@ const DotEnv = struct {
             try out.append(allocator, '\n');
         }
 
-        try base_dir.writeFile(.{ .sub_path = self.path, .data = out.items });
+        try base_dir.writeFile(io, .{ .sub_path = self.path, .data = out.items });
     }
 };
 
 fn getEnvRequired(
     allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
     stderr: anytype,
     dot_env: *DotEnv,
     name: []const u8,
 ) !?[]u8 {
-    if (try getEnvOptional(allocator, dot_env, name)) |val| return val;
+    if (try getEnvOptional(allocator, environ_map, dot_env, name)) |val| return val;
     try stderr.print("error: {s} is required\n", .{name});
     return null;
 }
 
-fn getEnvOptional(allocator: std.mem.Allocator, dot_env: *DotEnv, name: []const u8) !?[]u8 {
-    if (std.process.getEnvVarOwned(allocator, name)) |val| {
-        return val;
-    } else |err| switch (err) {
-        error.EnvironmentVariableNotFound => {},
-        else => return err,
+fn getEnvOptional(
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    dot_env: *DotEnv,
+    name: []const u8,
+) !?[]u8 {
+    if (environ_map.get(name)) |val| {
+        return try allocator.dupe(u8, val);
     }
 
     if (try dot_env.getOwned(allocator, name)) |val| return val;
@@ -657,19 +669,20 @@ fn getEnvOptional(allocator: std.mem.Allocator, dot_env: *DotEnv, name: []const 
 
 fn resolveAuthorUrn(
     allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
     stderr: anytype,
     dot_env: *DotEnv,
     client: *std.http.Client,
     access_token: []const u8,
 ) !?[]u8 {
-    var author_urn = try getEnvOptional(allocator, dot_env, "LINKEDIN_AUTHOR_URN");
+    var author_urn = try getEnvOptional(allocator, environ_map, dot_env, "LINKEDIN_AUTHOR_URN");
     if (author_urn) |urn| {
         if (urn.len != 0) return urn;
         allocator.free(urn);
         author_urn = null;
     }
 
-    const person_id = try getEnvOptional(allocator, dot_env, "LINKEDIN_PERSON_ID");
+    const person_id = try getEnvOptional(allocator, environ_map, dot_env, "LINKEDIN_PERSON_ID");
     defer if (person_id) |pid| allocator.free(pid);
     if (person_id) |pid| {
         if (pid.len == 0) {
@@ -700,13 +713,17 @@ fn resolveAuthorUrn(
 
 fn runLinkedInAuth(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    base_dir: std.Io.Dir,
     stdout: anytype,
     stderr: anytype,
     dot_env: *DotEnv,
 ) !u8 {
     const client_id = try getEnvOrPrompt(
         allocator,
+        environ_map,
+        io,
         stdout,
         dot_env,
         "LINKEDIN_CLIENT_ID",
@@ -717,6 +734,8 @@ fn runLinkedInAuth(
 
     const client_secret = try getEnvOrPrompt(
         allocator,
+        environ_map,
+        io,
         stdout,
         dot_env,
         "LINKEDIN_CLIENT_SECRET",
@@ -727,6 +746,8 @@ fn runLinkedInAuth(
 
     const redirect_uri = try getEnvOrPrompt(
         allocator,
+        environ_map,
+        io,
         stdout,
         dot_env,
         "LINKEDIN_REDIRECT_URI",
@@ -738,7 +759,7 @@ fn runLinkedInAuth(
     var redirect = try parseRedirectUri(allocator, redirect_uri);
     defer redirect.deinit(allocator);
 
-    const state = try randomStateHex(allocator, 16);
+    const state = try randomStateHex(allocator, io, 16);
     defer allocator.free(state);
 
     const auth_url = try linkedin.buildAuthUrl(
@@ -755,19 +776,19 @@ fn runLinkedInAuth(
     try stdout.print("{s}\n\n", .{auth_url});
     try stdout.print("Listening on {s}:{d} ...\n", .{ redirect.listen_host, redirect.port });
 
-    var listener = try std.net.Address.parseIp(redirect.listen_host, redirect.port);
-    var tcp_server = try listener.listen(.{ .reuse_address = true });
-    defer tcp_server.deinit();
+    var listener = try std.Io.net.IpAddress.parse(redirect.listen_host, redirect.port);
+    var tcp_server = try listener.listen(io, .{ .reuse_address = true });
+    defer tcp_server.deinit(io);
 
-    openUrlInBrowser(allocator, auth_url) catch {};
+    openUrlInBrowser(allocator, io, auth_url) catch {};
 
-    const code = waitForOAuthCode(allocator, &tcp_server, redirect.path, state, stdout, stderr) catch |err| {
+    const code = waitForOAuthCode(allocator, io, &tcp_server, redirect.path, state, stdout, stderr) catch |err| {
         try stderr.print("error: OAuth redirect failed: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer allocator.free(code);
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     var token = try linkedin.exchangeAuthCode(
@@ -800,7 +821,7 @@ fn runLinkedInAuth(
         defer allocator.free(expires_in_str);
         try dot_env.set(allocator, "LINKEDIN_ACCESS_TOKEN_EXPIRES_IN", expires_in_str);
 
-        const expires_at = std.time.timestamp() + expires_in;
+        const expires_at = std.Io.Timestamp.now(io, .real).toSeconds() + expires_in;
         const expires_at_str = try std.fmt.allocPrint(allocator, "{d}", .{expires_at});
         defer allocator.free(expires_at_str);
         try dot_env.set(allocator, "LINKEDIN_ACCESS_TOKEN_EXPIRES_AT", expires_at_str);
@@ -823,7 +844,7 @@ fn runLinkedInAuth(
         });
     }
 
-    try dot_env.write(allocator, base_dir);
+    try dot_env.write(allocator, io, base_dir);
 
     try stdout.print("Saved LinkedIn credentials to {s}.\n", .{dotenv_path});
     try stdout.writeAll("You can now post with:\n  zig build run -- linkedin --file posts/your-post.md\n");
@@ -846,8 +867,9 @@ fn parseRedirectUri(allocator: std.mem.Allocator, redirect_uri: []const u8) !Red
     const uri = std.Uri.parse(redirect_uri) catch return error.InvalidRedirectUri;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidRedirectUriScheme;
 
-    var host_buf: [std.Uri.host_name_max]u8 = undefined;
-    const host = uri.getHost(&host_buf) catch return error.InvalidRedirectUriHost;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host_name = uri.getHost(&host_buf) catch return error.InvalidRedirectUriHost;
+    const host = host_name.bytes;
     if (host.len == 0) return error.InvalidRedirectUriHost;
 
     var listen_host = host;
@@ -871,20 +893,21 @@ fn parseRedirectUri(allocator: std.mem.Allocator, redirect_uri: []const u8) !Red
 
 fn waitForOAuthCode(
     allocator: std.mem.Allocator,
-    tcp_server: *std.net.Server,
+    io: std.Io,
+    tcp_server: *std.Io.net.Server,
     expected_path: []const u8,
     expected_state: []const u8,
     stdout: anytype,
     stderr: anytype,
 ) ![]u8 {
-    const connection = try tcp_server.accept();
-    defer connection.stream.close();
+    const connection = try tcp_server.accept(io);
+    defer connection.close(io);
 
     var send_buffer: [4096]u8 = undefined;
     var recv_buffer: [4096]u8 = undefined;
-    var connection_reader = connection.stream.reader(&recv_buffer);
-    var connection_writer = connection.stream.writer(&send_buffer);
-    var http_server: std.http.Server = .init(connection_reader.interface(), &connection_writer.interface);
+    var connection_reader = connection.reader(io, &recv_buffer);
+    var connection_writer = connection.writer(io, &send_buffer);
+    var http_server: std.http.Server = .init(&connection_reader.interface, &connection_writer.interface);
 
     var request = http_server.receiveHead() catch |err| switch (err) {
         error.HttpConnectionClosing => return error.OAuthConnectionClosed,
@@ -987,11 +1010,11 @@ fn parseHexNibble(c: u8) !u8 {
     return error.InvalidHexDigit;
 }
 
-fn randomStateHex(allocator: std.mem.Allocator, bytes_len: usize) ![]u8 {
+fn randomStateHex(allocator: std.mem.Allocator, io: std.Io, bytes_len: usize) ![]u8 {
     const bytes = try allocator.alloc(u8, bytes_len);
     defer allocator.free(bytes);
 
-    std.crypto.random.bytes(bytes);
+    io.random(bytes);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -1007,19 +1030,21 @@ fn randomStateHex(allocator: std.mem.Allocator, bytes_len: usize) ![]u8 {
 
 fn getEnvOrPrompt(
     allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    io: std.Io,
     stdout: anytype,
     dot_env: *DotEnv,
     key: []const u8,
     prompt: []const u8,
     default_value: ?[]const u8,
 ) ![]u8 {
-    if (try getEnvOptional(allocator, dot_env, key)) |value| {
+    if (try getEnvOptional(allocator, environ_map, dot_env, key)) |value| {
         if (value.len != 0) return value;
         allocator.free(value);
     }
 
     while (true) {
-        const line = try promptLine(allocator, stdout, prompt, default_value);
+        const line = try promptLine(allocator, io, stdout, prompt, default_value);
         if (line.len == 0) {
             if (default_value) |d| {
                 allocator.free(line);
@@ -1034,6 +1059,7 @@ fn getEnvOrPrompt(
 
 fn promptLine(
     allocator: std.mem.Allocator,
+    io: std.Io,
     stdout: anytype,
     prompt: []const u8,
     default_value: ?[]const u8,
@@ -1044,18 +1070,14 @@ fn promptLine(
         try stdout.print("{s}", .{prompt});
     }
 
-    const stdin_reader = std.fs.File.stdin().deprecatedReader();
-    const raw = try stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 4096) orelse return error.EndOfStream;
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    const raw = (try stdin_reader.interface.takeDelimiter('\n')) orelse return error.EndOfStream;
     const trimmed = std.mem.trim(u8, raw, " \t\r");
-    if (trimmed.ptr != raw.ptr or trimmed.len != raw.len) {
-        const owned = try allocator.dupe(u8, trimmed);
-        allocator.free(raw);
-        return owned;
-    }
-    return raw;
+    return try allocator.dupe(u8, trimmed);
 }
 
-fn openUrlInBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
+fn openUrlInBrowser(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !void {
     const builtin = @import("builtin");
     const argv = switch (builtin.os.tag) {
         .macos => &[_][]const u8{ "open", url },
@@ -1064,11 +1086,13 @@ fn openUrlInBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
         else => &[_][]const u8{ "xdg-open", url },
     };
 
-    _ = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = try std.process.run(allocator, io, .{
         .argv = argv,
-        .max_output_bytes = 0,
-    }) catch {};
+        .stdout_limit = .limited(0),
+        .stderr_limit = .limited(0),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 }
 
 fn parseEnvLine(allocator: std.mem.Allocator, raw_line: []const u8) !EnvLine {
@@ -1079,7 +1103,7 @@ fn parseEnvLine(allocator: std.mem.Allocator, raw_line: []const u8) !EnvLine {
 
     var line = trimmed;
     if (std.mem.startsWith(u8, line, "export ")) {
-        line = std.mem.trimLeft(u8, line["export ".len..], " \t");
+        line = std.mem.trimStart(u8, line["export ".len..], " \t");
     }
 
     const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
@@ -1108,7 +1132,7 @@ fn parseEnvValue(raw: []const u8) []const u8 {
     const hash = std.mem.indexOfScalar(u8, raw, '#') orelse return raw;
     if (hash == 0) return raw;
     if (std.mem.indexOfScalar(u8, raw[0..hash], ' ') != null or std.mem.indexOfScalar(u8, raw[0..hash], '\t') != null) {
-        return std.mem.trimRight(u8, raw[0..hash], " \t");
+        return std.mem.trimEnd(u8, raw[0..hash], " \t");
     }
     return raw;
 }
@@ -1139,7 +1163,8 @@ fn needsEnvQuote(value: []const u8) bool {
 
 fn gitChangedPostPaths(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    base_dir: std.Io.Dir,
     posts_dir: []const u8,
     from_ref: []const u8,
 ) !std.ArrayList([]const u8) {
@@ -1158,29 +1183,29 @@ fn gitChangedPostPaths(
         range,
     };
 
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
+    const result = try std.process.run(allocator, io, .{
         .argv = &argv,
-        .cwd_dir = base_dir,
-        .max_output_bytes = 1024 * 1024,
+        .cwd = .{ .dir = base_dir },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             return error.GitDiffFailed;
         },
         else => return error.GitDiffFailed,
     }
 
-    const posts_root = std.mem.trimRight(u8, posts_dir, "/");
+    const posts_root = std.mem.trimEnd(u8, posts_dir, "/");
     const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{posts_root});
     defer allocator.free(prefix);
 
     var it = std.mem.splitScalar(u8, result.stdout, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) continue;
         if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
         if (!std.mem.endsWith(u8, trimmed, ".md")) continue;
@@ -1207,16 +1232,19 @@ fn isZeroOid(oid: []const u8) bool {
 test "serve arg parsing rejects missing values" {
     const testing = std.testing;
 
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    defer stdout_buf.deinit(testing.allocator);
-    var stderr_buf: std.ArrayList(u8) = .empty;
-    defer stderr_buf.deinit(testing.allocator);
+    var stdout_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_buf.deinit();
+    var stderr_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stderr_buf.deinit();
 
-    const stdout_writer = stdout_buf.writer(testing.allocator);
-    const stderr_writer = stderr_buf.writer(testing.allocator);
+    const stdout_writer = &stdout_buf.writer;
+    const stderr_writer = &stderr_buf.writer;
+
+    var environ_map = std.process.Environ.Map.init(testing.allocator);
+    defer environ_map.deinit();
 
     const args = [_][]const u8{ "blog", "serve", "--port" };
-    const exit_code = try run(testing.allocator, std.fs.cwd(), &args, stdout_writer, stderr_writer);
+    const exit_code = try run(testing.allocator, std.testing.io, &environ_map, std.Io.Dir.cwd(), &args, stdout_writer, stderr_writer);
     try testing.expectEqual(@as(u8, 2), exit_code);
-    try testing.expect(std.mem.indexOf(u8, stderr_buf.items, "Usage:") != null);
+    try testing.expect(std.mem.indexOf(u8, stderr_buf.writer.buffered(), "Usage:") != null);
 }

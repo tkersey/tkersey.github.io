@@ -3,11 +3,11 @@
     .version = "0.0.1",
     .dependencies = .{
         .cmark_gfm = .{
-            .url = "git+https://github.com/kristoff-it/cmark-gfm.git#b96c27a5152b9124d657dee7fb1186d0a13c1fe4",
-            .hash = "cmark_gfm-0.1.0-uQgTK6WZFwCG9y7_Z0IkCINtmMTwvEZTyVh_6nsaMVPq",
+            .url = "git+https://github.com/kristoff-it/cmark-gfm.git#cd0aba87cc89f0c8aa9393e59505db271ea30239",
+            .hash = "cmark_gfm-0.1.0-uQgTKymaFwDK0jVZszXfDtQtW6BnS44Bp0GS55TVBD4p",
         },
     },
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .paths = .{""},
     .fingerprint = 0xc0155143fb3ee373,
 }

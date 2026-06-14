@@ -10,16 +10,16 @@ pub const WatchTargets = struct {
     site_config_path: []const u8 = "site.yml",
 };
 
-pub fn fingerprint(allocator: std.mem.Allocator, base_dir: std.fs.Dir, targets: WatchTargets) !u64 {
+pub fn fingerprint(allocator: std.mem.Allocator, io: std.Io, base_dir: std.Io.Dir, targets: WatchTargets) !u64 {
     var acc: FingerprintAcc = .{};
 
-    const base_abs = try base_dir.realpathAlloc(allocator, ".");
+    const base_abs = try base_dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(base_abs);
 
-    try addDirTreeFingerprint(allocator, base_dir, base_abs, targets.posts_dir_path, &acc);
-    try addDirTreeFingerprint(allocator, base_dir, base_abs, targets.static_dir_path, &acc);
-    try addDirTreeFingerprint(allocator, base_dir, base_abs, targets.templates_dir_path, &acc);
-    try addFileFingerprint(base_dir, targets.site_config_path, &acc);
+    try addDirTreeFingerprint(allocator, io, base_dir, base_abs, targets.posts_dir_path, &acc);
+    try addDirTreeFingerprint(allocator, io, base_dir, base_abs, targets.static_dir_path, &acc);
+    try addDirTreeFingerprint(allocator, io, base_dir, base_abs, targets.templates_dir_path, &acc);
+    try addFileFingerprint(io, base_dir, targets.site_config_path, &acc);
 
     return acc.final();
 }
@@ -44,8 +44,8 @@ const FingerprintAcc = struct {
     }
 };
 
-fn addFileFingerprint(base_dir: std.fs.Dir, path: []const u8, acc: *FingerprintAcc) !void {
-    const stat = base_dir.statFile(path) catch |err| switch (err) {
+fn addFileFingerprint(io: std.Io, base_dir: std.Io.Dir, path: []const u8, acc: *FingerprintAcc) !void {
+    const stat = base_dir.statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             acc.add(hashSentinel(path, .missing_file));
             return;
@@ -59,7 +59,7 @@ fn addFileFingerprint(base_dir: std.fs.Dir, path: []const u8, acc: *FingerprintA
     }
 
     const content_hash = if (stat.kind == .file and stat.size <= max_content_hash_bytes)
-        try hashFileContent(base_dir, path, max_content_hash_bytes)
+        try hashFileContent(io, base_dir, path, max_content_hash_bytes)
     else
         null;
 
@@ -68,14 +68,15 @@ fn addFileFingerprint(base_dir: std.fs.Dir, path: []const u8, acc: *FingerprintA
 
 fn addDirTreeFingerprint(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    io: std.Io,
+    base_dir: std.Io.Dir,
     base_abs: []const u8,
     dir_path: []const u8,
     acc: *FingerprintAcc,
 ) !void {
     try validateWatchTargetDirPath(dir_path);
 
-    const dir_abs = base_dir.realpathAlloc(allocator, dir_path) catch |err| switch (err) {
+    const dir_abs = base_dir.realPathFileAlloc(io, dir_path, allocator) catch |err| switch (err) {
         error.FileNotFound => {
             acc.add(hashSentinel(dir_path, .missing_dir));
             return;
@@ -87,12 +88,12 @@ fn addDirTreeFingerprint(
     if (std.mem.eql(u8, dir_abs, base_abs)) return error.WatchTargetIsBaseDir;
     if (!pathContains(base_abs, dir_abs)) return error.WatchTargetEscapesBaseDir;
 
-    var root = try base_dir.openDir(dir_path, .{ .iterate = true });
-    defer root.close();
+    var root = try base_dir.openDir(io, dir_path, .{ .iterate = true });
+    defer root.close(io);
 
     acc.add(hashSentinel(dir_path, .present_dir));
 
-    var stack: std.ArrayListUnmanaged([]u8) = .{};
+    var stack: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (stack.items) |p| allocator.free(p);
         stack.deinit(allocator);
@@ -107,28 +108,29 @@ fn addDirTreeFingerprint(
     while (stack.pop()) |rel_path| {
         defer allocator.free(rel_path);
 
-        var dir: std.fs.Dir = root;
+        var dir: std.Io.Dir = root;
         var close_dir = false;
         if (rel_path.len != 0) {
-            dir = try root.openDir(rel_path, .{ .iterate = true });
+            dir = try root.openDir(io, rel_path, .{ .iterate = true });
             close_dir = true;
         }
-        defer if (close_dir) dir.close();
+        defer if (close_dir) dir.close(io);
 
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(io)) |entry| {
             switch (entry.kind) {
                 .file => {
-                    const stat = try dir.statFile(entry.name);
+                    const stat = try dir.statFile(io, entry.name, .{});
                     const content_hash = if (stat.size <= max_content_hash_bytes)
-                        try hashFileContent(dir, entry.name, max_content_hash_bytes)
+                        try hashFileContent(io, dir, entry.name, max_content_hash_bytes)
                     else
                         null;
                     acc.add(hashTreeFile(dir_path, rel_path, entry.name, stat, content_hash));
                 },
                 .sym_link => {
                     var buf: [max_symlink_target_bytes]u8 = undefined;
-                    const target = dir.readLink(entry.name, &buf) catch null;
+                    const target_len = dir.readLink(io, entry.name, &buf) catch null;
+                    const target = if (target_len) |n| buf[0..n] else null;
                     acc.add(hashSymlinkEntry(dir_path, rel_path, entry.name, target));
                 },
                 else => acc.add(hashDirEntry(dir_path, rel_path, entry)),
@@ -196,7 +198,7 @@ fn hashSentinel(path: []const u8, kind: SentinelKind) u64 {
     return h.final();
 }
 
-fn hashDirEntry(root_path: []const u8, rel_dir_path: []const u8, entry: std.fs.Dir.Entry) u64 {
+fn hashDirEntry(root_path: []const u8, rel_dir_path: []const u8, entry: std.Io.Dir.Entry) u64 {
     var h = std.hash.Wyhash.init(0);
     h.update("entry");
     h.update(&.{0});
@@ -232,7 +234,7 @@ fn hashTreeFile(
     root_path: []const u8,
     rel_dir_path: []const u8,
     name: []const u8,
-    stat: std.fs.File.Stat,
+    stat: std.Io.File.Stat,
     content_hash: ?u64,
 ) u64 {
     var h = std.hash.Wyhash.init(0);
@@ -253,7 +255,7 @@ fn hashTreeFile(
     return h.final();
 }
 
-fn hashFile(path: []const u8, stat: std.fs.File.Stat, content_hash: ?u64) u64 {
+fn hashFile(path: []const u8, stat: std.Io.File.Stat, content_hash: ?u64) u64 {
     var h = std.hash.Wyhash.init(0);
     h.update("file");
     h.update(&.{0});
@@ -268,19 +270,23 @@ fn hashFile(path: []const u8, stat: std.fs.File.Stat, content_hash: ?u64) u64 {
     return h.final();
 }
 
-fn hashFileContent(dir: std.fs.Dir, sub_path: []const u8, max_bytes: u64) !u64 {
-    var file = try dir.openFile(sub_path, .{});
-    defer file.close();
+fn hashFileContent(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, max_bytes: u64) !u64 {
+    var file = try dir.openFile(io, sub_path, .{});
+    defer file.close(io);
 
     var h = std.hash.Wyhash.init(0);
     h.update("content");
     h.update(&.{0});
 
     var buf: [8192]u8 = undefined;
+    var reader_buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &reader_buf);
     var remaining = max_bytes;
     while (remaining > 0) {
         const to_read: usize = @min(buf.len, @as(usize, @intCast(remaining)));
-        const n = try file.readAll(buf[0..to_read]);
+        const n = reader.interface.readSliceShort(buf[0..to_read]) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+        };
         if (n == 0) break;
         h.update(buf[0..n]);
         remaining -= n;
@@ -295,21 +301,21 @@ test "fingerprint changes when inputs change" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("posts");
-    try tmp.dir.makePath("static");
-    try tmp.dir.writeFile(.{ .sub_path = "site.yml", .data = "title: x\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = 
+    try tmp.dir.createDirPath(std.testing.io, "posts");
+    try tmp.dir.createDirPath(std.testing.io, "static");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site.yml", .data = "title: x\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/a.md", .data =
         \\---
         \\title: A
         \\date: 2025-12-01
         \\---
         \\hi
     });
-    try tmp.dir.writeFile(.{ .sub_path = "static/style.css", .data = "a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "static/style.css", .data = "a" });
 
-    const a = try fingerprint(testing.allocator, tmp.dir, .{});
+    const a = try fingerprint(testing.allocator, std.testing.io, tmp.dir, .{});
 
-    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = 
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/a.md", .data =
         \\---
         \\title: A
         \\date: 2025-12-01
@@ -317,7 +323,7 @@ test "fingerprint changes when inputs change" {
         \\hello
     });
 
-    const b = try fingerprint(testing.allocator, tmp.dir, .{});
+    const b = try fingerprint(testing.allocator, std.testing.io, tmp.dir, .{});
     try testing.expect(a != b);
 }
 
@@ -327,9 +333,9 @@ test "fingerprint changes when a watched directory appears" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const a = try fingerprint(testing.allocator, tmp.dir, .{});
-    try tmp.dir.makePath("templates");
-    const b = try fingerprint(testing.allocator, tmp.dir, .{});
+    const a = try fingerprint(testing.allocator, std.testing.io, tmp.dir, .{});
+    try tmp.dir.createDirPath(std.testing.io, "templates");
+    const b = try fingerprint(testing.allocator, std.testing.io, tmp.dir, .{});
     try testing.expect(a != b);
 }
 
@@ -342,16 +348,16 @@ test "fingerprint changes when a symlink target changes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("posts");
-    try tmp.dir.writeFile(.{ .sub_path = "posts/a.md", .data = "a\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "posts/b.md", .data = "b\n" });
+    try tmp.dir.createDirPath(std.testing.io, "posts");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/a.md", .data = "a\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "posts/b.md", .data = "b\n" });
 
-    try tmp.dir.symLink("a.md", "posts/link.md", .{ .is_directory = false });
-    const a = try fingerprint(testing.allocator, tmp.dir, .{});
+    try tmp.dir.symLink(std.testing.io, "a.md", "posts/link.md", .{ .is_directory = false });
+    const a = try fingerprint(testing.allocator, std.testing.io, tmp.dir, .{});
 
-    try tmp.dir.deleteFile("posts/link.md");
-    try tmp.dir.symLink("b.md", "posts/link.md", .{ .is_directory = false });
-    const b = try fingerprint(testing.allocator, tmp.dir, .{});
+    try tmp.dir.deleteFile(std.testing.io, "posts/link.md");
+    try tmp.dir.symLink(std.testing.io, "b.md", "posts/link.md", .{ .is_directory = false });
+    const b = try fingerprint(testing.allocator, std.testing.io, tmp.dir, .{});
 
     try testing.expect(a != b);
 }
@@ -364,7 +370,7 @@ test "fingerprint rejects invalid watch target paths" {
 
     try testing.expectError(
         error.InvalidWatchTargetPath,
-        fingerprint(testing.allocator, tmp.dir, .{ .posts_dir_path = ".." }),
+        fingerprint(testing.allocator, std.testing.io, tmp.dir, .{ .posts_dir_path = ".." }),
     );
 }
 
@@ -377,19 +383,19 @@ test "fingerprint rejects watch targets that escape the base dir" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base_abs = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(base_abs);
 
     const parent_abs = std.fs.path.dirname(base_abs) orelse return error.TestExpectedEqual;
-    var parent_dir = try std.fs.openDirAbsolute(parent_abs, .{});
-    defer parent_dir.close();
+    var parent_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, parent_abs, .{});
+    defer parent_dir.close(std.testing.io);
 
-    try parent_dir.makePath("outside-watch");
-    defer parent_dir.deleteTree("outside-watch") catch {};
-    try tmp.dir.symLink("../outside-watch", "posts", .{ .is_directory = true });
+    try parent_dir.createDirPath(std.testing.io, "outside-watch");
+    defer parent_dir.deleteTree(std.testing.io, "outside-watch") catch {};
+    try tmp.dir.symLink(std.testing.io, "../outside-watch", "posts", .{ .is_directory = true });
 
     try testing.expectError(
         error.WatchTargetEscapesBaseDir,
-        fingerprint(testing.allocator, tmp.dir, .{ .posts_dir_path = "posts" }),
+        fingerprint(testing.allocator, std.testing.io, tmp.dir, .{ .posts_dir_path = "posts" }),
     );
 }

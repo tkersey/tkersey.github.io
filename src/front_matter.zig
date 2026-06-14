@@ -43,7 +43,7 @@ pub const FrontMatter = struct {
     date_raw: []const u8,
     date: Date,
     description: ?[]const u8 = null,
-    tags: std.ArrayListUnmanaged([]const u8) = .{},
+    tags: std.ArrayListUnmanaged([]const u8) = .empty,
     draft: bool = false,
     slug: ?[]const u8 = null,
 
@@ -112,7 +112,7 @@ pub fn splitFrontMatter(input: []const u8) !Split {
 }
 
 fn isDelimiterLine(line: []const u8) bool {
-    const trimmed = std.mem.trim(u8, std.mem.trimRight(u8, line, "\r"), " \t");
+    const trimmed = std.mem.trim(u8, std.mem.trimEnd(u8, line, "\r"), " \t");
     return std.mem.eql(u8, trimmed, "---");
 }
 
@@ -122,19 +122,19 @@ fn parseFrontMatter(allocator: std.mem.Allocator, input: []const u8) !FrontMatte
     var description: ?[]const u8 = null;
     var draft = false;
     var slug: ?[]const u8 = null;
-    var tags: std.ArrayListUnmanaged([]const u8) = .{};
+    var tags: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer tags.deinit(allocator);
 
     var list_key: ?[]const u8 = null;
     var it = std.mem.splitScalar(u8, input, '\n');
     while (it.next()) |raw_line| {
-        const trimmed = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        const trimmed = std.mem.trim(u8, std.mem.trimEnd(u8, raw_line, "\r"), " \t");
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue;
 
         if (list_key) |key| {
             if (std.mem.startsWith(u8, trimmed, "-")) {
-                const item_raw = std.mem.trimLeft(u8, trimmed[1..], " \t");
+                const item_raw = std.mem.trimStart(u8, trimmed[1..], " \t");
                 const item = scalars.parseScalar(scalars.stripInlineComment(item_raw));
                 if (std.mem.eql(u8, key, "tags")) try tags.append(allocator, item);
                 continue;
@@ -143,8 +143,8 @@ fn parseFrontMatter(allocator: std.mem.Allocator, input: []const u8) !FrontMatte
         }
 
         const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.FrontMatterInvalidSyntax;
-        const key = std.mem.trimRight(u8, trimmed[0..colon], " \t");
-        var value = std.mem.trimLeft(u8, trimmed[colon + 1 ..], " \t");
+        const key = std.mem.trimEnd(u8, trimmed[0..colon], " \t");
+        var value = std.mem.trimStart(u8, trimmed[colon + 1 ..], " \t");
         value = scalars.stripInlineComment(value);
 
         if (value.len == 0) {

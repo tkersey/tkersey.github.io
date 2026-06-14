@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - run: zig fmt --check build.zig src/*.zig
       - run: zig build test
       - run: zig build -Doptimize=ReleaseSafe
@@ -63,7 +63,7 @@ jobs:
           fetch-depth: 0
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Post to LinkedIn
         env:
           LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}

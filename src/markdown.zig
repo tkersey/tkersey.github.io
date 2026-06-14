@@ -6,16 +6,10 @@ const c = @cImport({
     @cInclude("cmark-gfm-extension_api.h");
 });
 
-fn ensureCoreExtensionsRegistered() void {
-    c.cmark_gfm_core_extensions_ensure_registered();
-}
-
-var core_extensions_once = std.once(ensureCoreExtensionsRegistered);
-
 /// Render Markdown as an HTML fragment.
 /// Returns an owned slice; caller must free it with `allocator.free`.
 pub fn renderHtmlAlloc(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
-    core_extensions_once.call();
+    c.cmark_gfm_core_extensions_ensure_registered();
 
     if (!std.unicode.utf8ValidateSlice(markdown)) return error.InvalidUtf8;
 
